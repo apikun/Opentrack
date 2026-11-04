@@ -44,21 +44,29 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a "${{ matrix.artifact }}" ${{ matrix.cli }} ${{ matrix.app }} ..\..\..\README.md ..\..\..\LICENSE
+          $stage = "$env:RUNNER_TEMP/stage"
+          New-Item -ItemType Directory -Force "$stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.cli }}" "$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.app }}" "$stage/"
+          Copy-Item README.md, LICENSE "$stage/"
+          7z a "${{ matrix.artifact }}" "$stage/*"
       - name: Package (tar — Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf "${{ matrix.artifact }}" ${{ matrix.cli }} ${{ matrix.app }} ../../../README.md ../../../LICENSE
+          stage="${RUNNER_TEMP:-/tmp}/stage"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/${{ matrix.cli }}" \
+             "target/${{ matrix.target }}/release/${{ matrix.app }}" \
+             README.md LICENSE "$stage/"
+          tar czf "${{ matrix.artifact }}" -C "$stage" .
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
           if-no-files-found: error
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          files: ${{ matrix.artifact }}
           fail_on_unmatched_files: true
