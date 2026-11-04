@@ -1,15 +1,18 @@
-//! MP4/H.264 video decoding for the M1 preview pane.
+//! Video decoding for preview and the M3 render pipeline.
 //!
-//! The demuxer ([`craft_media`] `isobmff`) and the H.264 decoder
+//! The MP4 demuxer ([`craft_media`] `isobmff`) and the H.264 decoder
 //! ([`filmcraft_h264`]) are external pure-Rust crates, both dual-licensed
-//! MIT OR Apache-2.0 (see `ATTRIBUTION.md` in the repository root). This
-//! module is the glue: container → avcC → decoder → planar 4:2:0 → packed
-//! RGBA8 with a small LRU frame cache, plus a dependency-free BMP writer so
-//! the CLI can export frames headlessly.
+//! MIT OR Apache-2.0 (see `ATTRIBUTION.md` in the repository root). The
+//! MJPEG-AVI path ([`MjpegAviDecoder`]) is entirely in-house (see
+//! [`crate::avi`]); anything else falls back to the ffmpeg bridge
+//! ([`FfmpegVideoDecoder`]) when the tools are on `PATH`.
 //!
-//! Scope (M1): progressive 8-bit 4:2:0 H.264 in MP4/MOV. HEVC/AV1/ProRes
-//! probe fine (stream info) but do not decode yet — RFC-0007 tracks the
-//! video roadmap. Audio playback is M2.
+//! The [`VideoDecoder`] trait (RFC-0007) consolidates all of them:
+//! `info` / `seek_frame` / `next_frame` → RGBA8. [`open_video_any`] picks
+//! the right implementation by sniffing the container.
+//!
+//! Scope: progressive 8-bit H.264 in MP4/MOV and Motion-JPEG AVI decode in
+//! pure Rust; every other codec/container via ffmpeg. Audio playback is M2.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -34,6 +37,9 @@ pub enum VideoError {
     /// The H.264 bitstream rejected a sample.
     #[error("h264: {0}")]
     H264(#[from] filmcraft_h264::Error),
+    /// An image decode failure (JPEG frames, stills).
+    #[error("image: {0}")]
+    Image(String),
 }
 
 /// Static description of a video file (probe result).
@@ -79,7 +85,7 @@ const CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// decode forward (correct for closed GOPs; open-GOP files may show brief
 /// artifacts after a seek — a documented M1 limitation). Backward seeks get a
 /// fresh decoder so stale DPB state can never leak into a new position.
-pub struct VideoDecoder {
+pub struct Mp4H264Decoder {
     file: Mp4File,
     src: std::fs::File,
     path: PathBuf,
@@ -97,9 +103,11 @@ pub struct VideoDecoder {
     cache: HashMap<i64, std::sync::Arc<RgbaFrame>>,
     cache_order: VecDeque<i64>,
     cache_bytes: usize,
+    /// Cursor used by the [`VideoDecoder`] trait impl (sequential reads).
+    cursor: u64,
 }
 
-impl VideoDecoder {
+impl Mp4H264Decoder {
     /// Opens `path` and probes it; fails cleanly when there is no decodable
     /// H.264 video track.
     pub fn open(path: &Path) -> Result<Self, VideoError> {
@@ -165,6 +173,7 @@ impl VideoDecoder {
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
             cache_bytes: 0,
+            cursor: 0,
         })
     }
 
@@ -308,9 +317,10 @@ fn codec_tag(c: &CodecConfig) -> String {
     }
 }
 
-/// Probes a file through the MP4/MOV path without keeping a decoder open.
+/// Probes an MP4/MOV file through the H.264 path without keeping a decoder
+/// open. For format-agnostic probing use [`probe_video_any`].
 pub fn probe_video(path: &Path) -> Result<VideoInfo, VideoError> {
-    VideoDecoder::open(path).map(|d| d.info().clone())
+    Mp4H264Decoder::open(path).map(|d| d.info().clone())
 }
 
 /// Converts a planar 4:2:0 picture to packed RGBA8 with bilinear chroma
@@ -464,6 +474,450 @@ pub fn write_bmp(frame: &RgbaFrame, path: &Path) -> Result<(), VideoError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// RFC-0007 trait + backends (M3)
+// ---------------------------------------------------------------------------
+
+/// RFC-0007 decoder contract: every video source presents itself as a
+/// sequential RGBA8 frame stream with random-access seeks.
+pub trait VideoDecoder: Send {
+    /// Static stream description captured at open time.
+    fn info(&self) -> VideoInfo;
+    /// Positions the cursor at frame `frame` (0-based). Decoding happens in
+    /// [`Self::next_frame`]; implementations may pre-decode to warm caches.
+    fn seek_frame(&mut self, frame: u64) -> Result<(), VideoError>;
+    /// Decodes and returns the frame at the cursor, advancing it.
+    fn next_frame(&mut self) -> Result<std::sync::Arc<RgbaFrame>, VideoError>;
+    /// Container path this decoder was opened from (best effort).
+    fn path(&self) -> Option<&Path> {
+        None
+    }
+}
+
+impl VideoDecoder for Mp4H264Decoder {
+    fn info(&self) -> VideoInfo {
+        self.info.clone()
+    }
+
+    fn seek_frame(&mut self, frame: u64) -> Result<(), VideoError> {
+        self.cursor = frame;
+        let fps = if self.info.fps > 0.5 {
+            self.info.fps
+        } else {
+            30.0
+        };
+        let t = frame as f64 / fps;
+        // Clamp inside the stream so a one-past-the-end seek does not error
+        // before next_frame gets a chance to report EOF itself.
+        let last = self.info.duration_secs;
+        let t = t.min(last.max(0.0));
+        self.decode_at(t).map(|_| ())
+    }
+
+    fn next_frame(&mut self) -> Result<std::sync::Arc<RgbaFrame>, VideoError> {
+        if self.info.frame_count > 0 && self.cursor >= self.info.frame_count as u64 {
+            return Err(VideoError::Container("video stream exhausted".into()));
+        }
+        let fps = if self.info.fps > 0.5 {
+            self.info.fps
+        } else {
+            30.0
+        };
+        let f = self.decode_at(self.cursor as f64 / fps)?;
+        self.cursor += 1;
+        Ok(f)
+    }
+
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+}
+
+/// Decodes one JPEG into packed RGBA8 via `zune-jpeg` (pure Rust).
+pub fn decode_jpeg_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), VideoError> {
+    use zune_core::colorspace::ColorSpace;
+    let options =
+        zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+    let mut dec = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
+    dec.decode_headers()
+        .map_err(|e| VideoError::Image(format!("jpeg headers: {e}")))?;
+    let (w, h) = dec
+        .dimensions()
+        .ok_or_else(|| VideoError::Image("jpeg: no dimensions".into()))?;
+    let out = dec
+        .decode()
+        .map_err(|e| VideoError::Image(format!("jpeg decode: {e}")))?;
+    Ok((w as u32, h as u32, out))
+}
+
+/// Pure-Rust Motion-JPEG AVI decoder (RFC-0007): an in-house RIFF walker
+/// ([`crate::avi`]) plus `zune-jpeg` per frame, with an LRU frame cache.
+pub struct MjpegAviDecoder {
+    src: std::fs::File,
+    path: PathBuf,
+    info: VideoInfo,
+    table: Vec<crate::avi::FrameRef>,
+    cursor: usize,
+    cache: HashMap<u64, std::sync::Arc<RgbaFrame>>,
+    cache_order: VecDeque<u64>,
+    cache_bytes: usize,
+}
+
+impl MjpegAviDecoder {
+    /// Opens and walks the AVI frame table; fails when there is no video
+    /// stream or the codec fourcc is not MJPEG.
+    pub fn open(path: &Path) -> Result<Self, VideoError> {
+        let mut f = std::fs::File::open(path)?;
+        let (avi, table) = crate::avi::read_avi_video(&mut f)
+            .map_err(|e| VideoError::Container(format!("{}: {e}", path.display())))?;
+        if &avi.codec != b"MJPG" {
+            return Err(VideoError::Unsupported(format!(
+                "AVI codec {} is not MJPEG - use the ffmpeg bridge",
+                String::from_utf8_lossy(&avi.codec)
+            )));
+        }
+        let fps = if avi.fps_den > 0 {
+            avi.fps_num as f64 / avi.fps_den as f64
+        } else {
+            0.0
+        };
+        let info = VideoInfo {
+            width: avi.width,
+            height: avi.height,
+            frame_count: table.len(),
+            fps,
+            duration_secs: if fps > 0.0 {
+                table.len() as f64 / fps
+            } else {
+                0.0
+            },
+            codec: "mjpeg".into(),
+            has_audio: false,
+        };
+        Ok(Self {
+            src: f,
+            path: path.to_path_buf(),
+            info,
+            table,
+            cursor: 0,
+            cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+            cache_bytes: 0,
+        })
+    }
+
+    fn decode_index(&mut self, idx: usize) -> Result<std::sync::Arc<RgbaFrame>, VideoError> {
+        let fr = self
+            .table
+            .get(idx)
+            .ok_or_else(|| VideoError::Container("video stream exhausted".into()))?;
+        use std::io::{Read, Seek, SeekFrom};
+        self.src.seek(SeekFrom::Start(fr.offset))?;
+        let mut buf = vec![0u8; fr.size as usize];
+        self.src.read_exact(&mut buf)?;
+        let (w, h, rgba) = decode_jpeg_rgba(&buf)?;
+        Ok(std::sync::Arc::new(RgbaFrame {
+            width: w,
+            height: h,
+            rgba,
+            pts_secs: idx as f64
+                / if self.info.fps > 0.5 {
+                    self.info.fps
+                } else {
+                    30.0
+                },
+            key: true,
+        }))
+    }
+
+    fn cache_insert(&mut self, idx: u64, frame: std::sync::Arc<RgbaFrame>) {
+        self.cache_bytes += frame.rgba.len();
+        self.cache_order.push_back(idx);
+        self.cache.insert(idx, frame);
+        while self.cache_bytes > CACHE_BUDGET_BYTES {
+            let Some(oldest) = self.cache_order.pop_front() else {
+                break;
+            };
+            if let Some(f) = self.cache.remove(&oldest) {
+                self.cache_bytes = self.cache_bytes.saturating_sub(f.rgba.len());
+            }
+        }
+    }
+}
+
+impl VideoDecoder for MjpegAviDecoder {
+    fn info(&self) -> VideoInfo {
+        self.info.clone()
+    }
+
+    fn seek_frame(&mut self, frame: u64) -> Result<(), VideoError> {
+        self.cursor = frame as usize;
+        Ok(())
+    }
+
+    fn next_frame(&mut self) -> Result<std::sync::Arc<RgbaFrame>, VideoError> {
+        let idx = self.cursor;
+        self.cursor += 1;
+        if let Some(hit) = self.cache.get(&(idx as u64)) {
+            return Ok(hit.clone());
+        }
+        let frame = self.decode_index(idx)?;
+        self.cache_insert(idx as u64, frame.clone());
+        Ok(frame)
+    }
+
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+}
+
+/// ffmpeg-bridge video decoder: everything the pure-Rust paths do not cover.
+///
+/// Spawns `ffmpeg -i in -f rawvideo -pix_fmt rgba -` and reads raw RGBA from
+/// the pipe (RFC-0007). Seeks respawn the process with an input-side `-ss`,
+/// which is frame-accurate because the rawvideo transcode decodes and drops
+/// everything before the requested point. `ffprobe` supplies the probe info.
+pub struct FfmpegVideoDecoder {
+    path: PathBuf,
+    info: VideoInfo,
+    child: Option<std::process::Child>,
+    stdout: Option<std::process::ChildStdout>,
+    cursor: u64,
+    frame_bytes: usize,
+}
+
+impl Drop for FfmpegVideoDecoder {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+impl FfmpegVideoDecoder {
+    /// Opens `path`; requires `ffprobe` and `ffmpeg` on `PATH`.
+    pub fn open(path: &Path) -> Result<Self, VideoError> {
+        let info = ffmpeg_probe(path)?;
+        let mut d = Self {
+            path: path.to_path_buf(),
+            info,
+            child: None,
+            stdout: None,
+            cursor: 0,
+            frame_bytes: 0,
+        };
+        d.frame_bytes = d.info.width as usize * d.info.height as usize * 4;
+        d.spawn_at(0.0)?;
+        Ok(d)
+    }
+
+    fn kill(&mut self) {
+        self.stdout.take();
+        if let Some(c) = self.child.take() {
+            let mut c = c;
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    fn spawn_at(&mut self, secs: f64) -> Result<(), VideoError> {
+        self.kill();
+        let args: Vec<String> = if secs > 0.0 {
+            vec![
+                "-ss".into(),
+                format!("{secs:.6}"),
+                "-i".into(),
+                self.path.to_string_lossy().into_owned(),
+            ]
+        } else {
+            vec!["-i".into(), self.path.to_string_lossy().into_owned()]
+        };
+        let mut child = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error"])
+            .args(&args)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| VideoError::Unsupported(format!("ffmpeg unavailable: {e}")))?;
+        let out = child
+            .stdout
+            .take()
+            .ok_or_else(|| VideoError::Unsupported("ffmpeg gave no stdout".into()))?;
+        self.child = Some(child);
+        self.stdout = Some(out);
+        Ok(())
+    }
+}
+
+impl VideoDecoder for FfmpegVideoDecoder {
+    fn info(&self) -> VideoInfo {
+        self.info.clone()
+    }
+
+    fn seek_frame(&mut self, frame: u64) -> Result<(), VideoError> {
+        if frame == self.cursor {
+            return Ok(());
+        }
+        let fps = if self.info.fps > 0.5 {
+            self.info.fps
+        } else {
+            30.0
+        };
+        self.cursor = frame;
+        self.spawn_at(frame as f64 / fps)
+    }
+
+    fn next_frame(&mut self) -> Result<std::sync::Arc<RgbaFrame>, VideoError> {
+        use std::io::Read;
+        let out = self
+            .stdout
+            .as_mut()
+            .ok_or_else(|| VideoError::Container("decoder pipe closed".into()))?;
+        let mut buf = vec![0u8; self.frame_bytes.max(1)];
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let n = out.read(&mut buf[filled..])?;
+            if n == 0 {
+                return Err(VideoError::Container("video stream exhausted".into()));
+            }
+            filled += n;
+        }
+        let fps = if self.info.fps > 0.5 {
+            self.info.fps
+        } else {
+            30.0
+        };
+        let f = std::sync::Arc::new(RgbaFrame {
+            width: self.info.width,
+            height: self.info.height,
+            rgba: buf,
+            pts_secs: self.cursor as f64 / fps,
+            key: false,
+        });
+        self.cursor += 1;
+        Ok(f)
+    }
+
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+}
+
+/// `ffprobe`-based probe for the bridge (JSON output parsed by hand).
+fn ffmpeg_probe(path: &Path) -> Result<VideoInfo, VideoError> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| VideoError::Unsupported(format!("ffprobe unavailable: {e}")))?;
+    if !out.status.success() {
+        return Err(VideoError::Unsupported(format!(
+            "ffprobe failed on {}",
+            path.display()
+        )));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| VideoError::Container(format!("ffprobe json: {e}")))?;
+    let s = v
+        .get("streams")
+        .and_then(|x| x.get(0))
+        .ok_or_else(|| VideoError::Container("no video stream".into()))?;
+    let width = s["width"].as_u64().unwrap_or(0) as u32;
+    let height = s["height"].as_u64().unwrap_or(0) as u32;
+    let codec = s["codec_name"].as_str().unwrap_or("unknown").to_string();
+    let (num, den) = match s["r_frame_rate"].as_str() {
+        Some(r) => {
+            let mut it = r.splitn(2, ':');
+            (
+                it.next().and_then(|x| x.parse::<u32>().ok()).unwrap_or(30),
+                it.next().and_then(|x| x.parse::<u32>().ok()).unwrap_or(1),
+            )
+        }
+        None => (30, 1),
+    };
+    let frame_count = s["nb_read_frames"]
+        .as_str()
+        .and_then(|x| x.parse::<usize>().ok())
+        .or_else(|| {
+            s["nb_frames"]
+                .as_str()
+                .and_then(|x| x.parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    let duration_secs = s["duration"]
+        .as_str()
+        .and_then(|x| x.parse::<f64>().ok())
+        .unwrap_or(if num > 0 {
+            frame_count as f64 * den as f64 / num as f64
+        } else {
+            0.0
+        });
+    let fps = if den > 0 {
+        num as f64 / den as f64
+    } else {
+        0.0
+    };
+    let has_audio = s.get("disposition").is_some(); // real check happens through the audio backends
+    Ok(VideoInfo {
+        width,
+        height,
+        frame_count,
+        fps,
+        duration_secs,
+        codec,
+        has_audio,
+    })
+}
+
+/// Opens `path` with the best pure-Rust decoder, falling back to the ffmpeg
+/// bridge (RFC-0007 dispatch): `RIFF` → MJPEG AVI, `ftyp` → MP4/MOV H.264,
+/// anything else → [`FfmpegVideoDecoder`] (which fails cleanly when the
+/// tools are missing).
+pub fn open_video_any(path: &Path) -> Result<Box<dyn VideoDecoder>, VideoError> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut magic = [0u8; 12];
+    let n = f.read(&mut magic)?;
+    drop(f);
+    let m = &magic[..n];
+    if m.starts_with(b"RIFF") {
+        return Ok(Box::new(MjpegAviDecoder::open(path)?));
+    }
+    if n >= 8 && &m[4..8] == b"ftyp" {
+        return Ok(Box::new(Mp4H264Decoder::open(path)?));
+    }
+    match FfmpegVideoDecoder::open(path) {
+        Ok(d) => Ok(Box::new(d)),
+        Err(e) => Err(VideoError::Container(format!(
+            "{}: no pure-Rust decoder for this container and {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Probes any supported video file (pure-Rust first, ffmpeg fallback).
+pub fn probe_video_any(path: &Path) -> Result<VideoInfo, VideoError> {
+    use std::io::Read;
+    let mut magic = [0u8; 12];
+    let mut f = std::fs::File::open(path)?;
+    let n = f.read(&mut magic)?;
+    drop(f);
+    let m = &magic[..n];
+    if m.starts_with(b"RIFF") || (n >= 8 && &m[4..8] == b"ftyp") {
+        return Ok(open_video_any(path)?.info());
+    }
+    ffmpeg_probe(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,7 +960,7 @@ mod tests {
             eprintln!("ffmpeg/libx264 unavailable - skipping");
             return;
         };
-        let mut dec = VideoDecoder::open(&path).expect("open fixture");
+        let mut dec = Mp4H264Decoder::open(&path).expect("open fixture");
         let info = dec.info().clone();
         assert_eq!(info.codec, "h264");
         assert_eq!((info.width, info.height), (320, 240));
@@ -540,6 +994,85 @@ mod tests {
         // Cached hit returns the same frame.
         let cached = dec.decode_at(0.05).expect("cache hit");
         assert_eq!(cached.rgba, fback.rgba);
+    }
+
+    #[test]
+    fn trait_sequential_read_matches_random_access() {
+        let dir = std::env::temp_dir();
+        let Some(path) = fixture(&dir) else {
+            eprintln!("ffmpeg/libx264 unavailable - skipping");
+            return;
+        };
+        let mut dec = Mp4H264Decoder::open(&path).expect("open");
+        VideoDecoder::seek_frame(&mut dec, 2).expect("seek 2");
+        let f2 = VideoDecoder::next_frame(&mut dec).expect("frame 2");
+        assert_eq!(f2.rgba.len(), 320 * 240 * 4);
+        let f3 = VideoDecoder::next_frame(&mut dec).expect("frame 3");
+        assert!(f3.pts_secs > f2.pts_secs || f3.pts_secs >= f2.pts_secs);
+        // exhaustion reported as a clean error, not a panic
+        let mut dec2 = Mp4H264Decoder::open(&path).unwrap();
+        let info = dec2.info().clone();
+        VideoDecoder::seek_frame(&mut dec2, info.frame_count as u64).unwrap();
+        assert!(VideoDecoder::next_frame(&mut dec2).is_err());
+    }
+
+    #[test]
+    fn mjpeg_avi_roundtrip_and_dispatch() {
+        // Encode 4 solid-color JPEG frames into an AVI with our muxer, then
+        // decode back through the trait + dispatch (RFC-0007 golden test).
+        let dir = std::env::temp_dir().join(format!("ot_mjpeg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("golden.avi");
+        let colors: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            let mut w = crate::avi::AviMjpegWriter::new(f, 32, 24, 10, 1);
+            for c in &colors {
+                let mut rgba = Vec::with_capacity(32 * 24 * 4);
+                for _ in 0..32 * 24 {
+                    rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
+                }
+                let mut jpeg = Vec::new();
+                let enc = jpeg_encoder::Encoder::new(&mut jpeg, 90);
+                enc.encode(&rgba, 32, 24, jpeg_encoder::ColorType::Rgba)
+                    .expect("jpeg encode");
+                w.write_jpeg_frame(&jpeg).expect("avi write");
+            }
+            w.finish().expect("avi finish");
+        }
+
+        // Trait path.
+        let mut dec = MjpegAviDecoder::open(&path).expect("open avi");
+        let info = dec.info();
+        assert_eq!(info.codec, "mjpeg");
+        assert_eq!((info.width, info.height), (32, 24));
+        assert_eq!(info.frame_count, 4);
+        VideoDecoder::seek_frame(&mut dec, 0).unwrap();
+        for (i, c) in colors.iter().enumerate() {
+            let f = VideoDecoder::next_frame(&mut dec).expect("frame");
+            assert_eq!((f.width, f.height), (32, 24), "frame {i} size");
+            // Average of the decoded frame must be near the source color
+            // (JPEG is lossy; allow small drift).
+            let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
+            for px in f.rgba.as_chunks::<4>().0 {
+                sr += px[0] as u64;
+                sg += px[1] as u64;
+                sb += px[2] as u64;
+            }
+            let n = 32_u64 * 24;
+            assert!((sr / n).abs_diff(c[0] as u64) < 12, "frame {i} R");
+            assert!((sg / n).abs_diff(c[1] as u64) < 12, "frame {i} G");
+            assert!((sb / n).abs_diff(c[2] as u64) < 12, "frame {i} B");
+        }
+        assert!(VideoDecoder::next_frame(&mut dec).is_err(), "EOF");
+
+        // Dispatch path: sniffing finds the MJPEG AVI by its RIFF magic.
+        let mut boxed = open_video_any(&path).expect("dispatch");
+        assert_eq!(boxed.info().codec, "mjpeg");
+        boxed.seek_frame(1).unwrap();
+        assert_eq!(boxed.next_frame().unwrap().rgba.len(), 32 * 24 * 4);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -614,7 +1147,7 @@ mod tests {
         let mut dir = std::env::temp_dir();
         dir.push(format!("ot_notmp4_{}.txt", std::process::id()));
         std::fs::write(&dir, b"definitely not an mp4 file").unwrap();
-        let err = match VideoDecoder::open(&dir) {
+        let err = match Mp4H264Decoder::open(&dir) {
             Err(e) => e,
             Ok(_) => panic!("non-mp4 must fail to open"),
         };

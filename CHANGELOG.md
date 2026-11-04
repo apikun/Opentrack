@@ -3,6 +3,89 @@
 All notable changes to OpenTrack are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com); versions are tagged `vX.Y.Z`.
 
+## [0.4.0] — M3 + M4 + M5: video pipeline, FX framework, ecosystem
+
+Milestones M3 (video decode/composite/render), M4 (FX framework) and M5
+(ecosystem & packaging) shipped together in this release.
+
+### Added — M3: video decode, composite, render (RFC-0007)
+
+- **`VideoDecoder` trait consolidation**: every video source now speaks the
+  RFC-0007 contract (`info` / `seek_frame` / `next_frame` → RGBA8).
+- **Pure-Rust Motion-JPEG AVI decode** (`engine::avi` + `MjpegAviDecoder`):
+  an in-house RIFF walker (chunk walker, `strh`/`strf` parse, `movi` frame
+  table, `idx1` fallback) plus `zune-jpeg` per frame with an LRU cache.
+- **ffmpeg bridge video decoder**: `ffmpeg -f rawvideo -pix_fmt rgba -` pipe
+  with `ffprobe`-based probing; frame-accurate seeks respawn with input-side
+  `-ss`. `open_video_any` dispatches by container sniff (RIFF → AVI, `ftyp`
+  → MP4/MOV, else bridge).
+- **CPU compositor** (`engine::composite`): video tracks stacked top-down,
+  per-track opacity, blend modes (Normal/Add/Multiply/Screen), event fades →
+  alpha ramps, letterbox-fit bilinear blit, stills (PNG/JPEG/BMP) decoded
+  once and cached.
+- **Shared frame cache** (`engine::frame_cache`): `(MediaId, frame)` keyed
+  LRU with a 256 MiB budget and hit/miss/eviction stats surfaced in the GUI.
+- **Video render pipeline** (`RenderJob::run_video`): compositor → JPEG
+  (pure Rust) → **pure-Rust AVI/MJPEG muxer** (streaming RIFF writer with
+  size patching + `idx1`), companion WAV master from the same tick clock,
+  optional PNG stills per frame; frame-count acceptance is tested (6.0 s @
+  30 fps → exactly 180 frames, WAV matches the mixer output).
+- **Optional AV1 export** behind `--features export-av1` (rav1e → IVF);
+  default builds stay pure.
+- **GUI**: the preview pane now shows the *composited* frame (all video
+  tracks) with a 1/1–1/4 scale toggle and decoded/cache/dropped counters.
+
+### Added — M4: FX framework (RFC-0004 completion)
+
+- **Automation lanes** (`core::fx::AutomationLane`): per-FX-parameter
+  control points with linear/constant interpolation, sampled at processing
+  block ticks; `.otp` format v2 (v1 files load unchanged via serde defaults).
+- **Audio FX DSP** (`engine::afx`): 3-band shelving/peaking EQ (RBJ
+  biquads), feed-forward compressor, brickwall limiter, Schroeder reverb
+  send — wired into the offline mixer (fixed 128-frame blocks, automation
+  sampled per block) through the same `AudioChainRunner` the realtime
+  engine uses.
+- **Parity guarantee**: offline and realtime share the processor types at
+  the f32 stage; a golden test proves one-call vs many-block processing is
+  bit-identical (`afx::tests::block_chunking_is_bit_identical_parity`).
+- **Video FX** (`engine::vfx`): brightness/contrast, saturation, baked 1D
+  LUTs (identity / film fade / crush blacks) — CPU reference implementations
+  applied per video track in the compositor.
+- **FX registry growth**: `audio.compressor`, `audio.limiter`,
+  `audio.reverb`, `video.lut` join the M0 descriptors; factory **presets**
+  (`core::fx::presets`) for every FX.
+- **FX rack UI**: per-track chain (domain-filtered add, reorder ↑/↓, bypass,
+  remove), parameter sliders from `ParamSpec`, preset buttons, automation
+  points add/remove at the playhead.
+
+### Added — M5: ecosystem & packaging
+
+- **Plugin ABI v0** (RFC-0009): the frozen audio-blocks/video-frames
+  contract, an in-process reference host (`engine::plugin`) and two builtin
+  example plugins (`builtin.stereo_width`, `builtin.tint`). Dynamic loading
+  stays behind its own future RFC.
+- **Scripting** (RFC-0010): Rhai-hosted batch surface over the project
+  document; `opentrack script FILE.rhai PROJECT.otp` runs and saves.
+- **Installers**: new `xtask` crate — `cargo xtask installer` builds the
+  release and packages the host platform (Windows zip + WiX/MSIX
+  scaffolding, Linux `.AppDir`/AppImage with `.desktop`, macOS `.app` +
+  dmg); `cargo xtask site` regenerates the static docs site.
+- **Packaging assets**: WiX source, MSIX manifest + script, AppImage
+  AppRun/desktop/icon, macOS signing/notarization runbook.
+- **Research**: RFC-0011 evaluates VST/iPlug-style hosting (verdict: CLAP
+  first, never VST2).
+- **Docs**: parity matrix 100% reviewed against 0.4.0; tutorial series in
+  `docs/tutorials/`.
+
+### Changed
+
+- `VideoDecoder` is now a trait; the M1 concrete MP4/H.264 decoder is
+  `Mp4H264Decoder` (was `VideoDecoder`).
+- The offline mixer processes tracks in fixed 128-frame blocks (needed for
+  FX-chain parity); mix output is bit-compatible for FX-free projects
+  modulo associativity-level rounding.
+- Workspace version 0.4.0; `.otp` FORMAT_VERSION 2.
+
 ## [0.3.0] — M2: realtime audio playback
 
 ### Added

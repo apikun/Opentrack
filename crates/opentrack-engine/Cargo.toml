@@ -26,5 +26,21 @@ craft-media = { version = "0.1.0", default-features = false, features = [
 ], git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7" }
 filmcraft-h264 = { git = "https://github.com/storytold/filmcraft", rev = "c9be14245a6c9da585ff906a6e0ca9c8200652ea" }
 
+# Pure-Rust image codecs for the M3 video pipeline (all MIT OR Apache-2.0):
+# zune-jpeg decodes Motion-JPEG frames + JPEG stills, jpeg-encoder encodes
+# AVI/MJPEG output, png handles PNG stills (read + write).
+zune-jpeg = "0.5"
+zune-core = "0.5"
+jpeg-encoder = "0.6"
+png = "0.18"
+
+# Rhai scripting for project-level batch ops (M5). MIT OR Apache-2.0.
+rhai = { version = "1.19", features = ["sync"] }
+
+# Optional AV1 export behind the `export-av1` feature (M3). Default builds
+# stay pure and never link it; the CLI gates the encoder behind the flag.
+rav1e = { version = "0.7", optional = true, default-features = false, features = ["threading"] }
+
 [features]
 out-cpal = ["dep:cpal"]
+export-av1 = ["dep:rav1e"]

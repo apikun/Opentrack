@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- WiX v3 source for the OpenTrack MSI. Build with:
+     wix.exe build OpenTrack.wxs -o OpenTrack.msi   (WiX v4)
+     or candle/light (WiX v3). The release CI ships the zip; the MSI is a
+     local packaging option for contributors. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="OpenTrack" Language="1033" Version="0.4.0"
+           Manufacturer="OpenTrack contributors"
+           UpgradeCode="1B5A6E9C-2F4D-4E7A-9A21-0C7B4A2F9E11">
+    <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine"/>
+    <MajorUpgrade DowngradeErrorMessage="A newer version of OpenTrack is already installed."/>
+    <MediaTemplate EmbedCab="yes"/>
+    <Feature Id="ProductFeature" Title="OpenTrack" Level="1">
+      <ComponentGroupRef Id="Binaries"/>
+    </Feature>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="OpenTrackDir" Name="OpenTrack"/>
+      </Directory>
+    </Directory>
+    <ComponentGroup Id="Binaries" Directory="OpenTrackDir">
+      <Component Id="Cli" Guid="*">
+        <File Id="CliExe" Source="opentrack.exe" KeyPath="yes"/>
+      </Component>
+      <Component Id="App" Guid="*">
+        <File Id="AppExe" Source="opentrack-app.exe" KeyPath="yes"/>
+        <Shortcut Id="AppShortcut" Directory="ProgramMenuDir" Name="OpenTrack"
+                  WorkingDirectory="INSTALLDIR" Advertise="yes"/>
+      </Component>
+    </ComponentGroup>
+    <DirectoryRef Id="TARGETDIR">
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="OpenTrack"/>
+      </Directory>
+    </DirectoryRef>
+  </Product>
+</Wix>

@@ -17,7 +17,6 @@
 use opentrack_core::save;
 use opentrack_engine::RenderJob;
 use opentrack_engine::codec::default_backends;
-use opentrack_engine::mixer::RenderSettings;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -37,8 +36,14 @@ COMMANDS:
     probe FILE                     identify media via the backend chain
     frame FILE [--at SECS] [-o OUT.bmp]
                                    decode one video frame to a BMP (pure-Rust H.264)
-    render PROJECT [-o OUT] [--rate HZ]
-                                   offline audio render of a .otp project
+    render PROJECT [-o OUT] [--rate HZ] [--video OUT.avi] [--frames DIR]
+                                   [--quality N] [--export-av1]
+                                   offline render; --video adds the M3
+                                   compositor -> MJPEG-AVI pipeline (+ WAV
+                                   master + optional PNG stills); --export-av1
+                                   needs the `export-av1` feature build
+    script FILE.rhai PROJECT.otp   run a project-level batch script (Rhai,
+                                   RFC-0010) and save the result
     smoke [--minutes N] [--realtime]
                                    play an 8-track session through the realtime
                                    engine (M2 acceptance: zero underruns)
@@ -86,6 +91,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "probe" => cmd_probe(rest),
         "frame" => cmd_frame(rest),
         "render" => cmd_render(rest),
+        "script" => cmd_script(rest),
         "smoke" => cmd_smoke(rest),
         "gui" => {
             println!("The egui shell is the `opentrack-app` crate. Launch it with:");
@@ -164,13 +170,14 @@ fn cmd_probe(rest: &[String]) -> Result<ExitCode, String> {
             Err(e) => println!("-> {e}"),
         }
     }
-    // Pure-Rust MP4/MOV video probe (works without ffmpeg; decodable = H.264).
-    match opentrack_engine::probe_video(path) {
+    // Pure-Rust video probe (MP4/H.264 + MJPEG-AVI without ffmpeg; anything
+    // else through the ffmpeg bridge when the tools exist).
+    match opentrack_engine::probe_video_any(path) {
         Ok(v) => {
             any_ok = true;
             println!(
                 "  {:<14} duration {:.3}s streams: [video {}x{} {:.2}fps {}{} frames]{}",
-                "isobmff",
+                "video",
                 v.duration_secs,
                 v.width,
                 v.height,
@@ -180,7 +187,7 @@ fn cmd_probe(rest: &[String]) -> Result<ExitCode, String> {
                 if v.has_audio { " +audio" } else { "" }
             );
         }
-        Err(e) => println!("  {:<14}-> {e}", "isobmff"),
+        Err(e) => println!("  {:<14}-> {e}", "video"),
     }
     if any_ok {
         Ok(ExitCode::SUCCESS)
@@ -218,11 +225,14 @@ fn cmd_frame(rest: &[String]) -> Result<ExitCode, String> {
     let file = file.ok_or("usage: opentrack frame FILE [--at SECS] [-o OUT.bmp]")?;
     let out = out.unwrap_or_else(|| PathBuf::from("frame.bmp"));
 
-    let mut dec = opentrack_engine::VideoDecoder::open(&file)
+    let mut dec = opentrack_engine::open_video_any(&file)
         .map_err(|e| format!("open {}: {e}", file.display()))?;
-    let info = dec.info().clone();
+    let info = dec.info();
+    let fps = if info.fps > 0.5 { info.fps } else { 30.0 };
+    dec.seek_frame((at * fps).round().max(0.0) as u64)
+        .map_err(|e| format!("seek to {at:.3}s: {e}"))?;
     let frame = dec
-        .decode_at(at)
+        .next_frame()
         .map_err(|e| format!("decode at {at:.3}s: {e}"))?;
     opentrack_engine::write_bmp(&frame, &out)
         .map_err(|e| format!("write {}: {e}", out.display()))?;
@@ -287,10 +297,54 @@ fn cmd_smoke(rest: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+fn cmd_script(rest: &[String]) -> Result<ExitCode, String> {
+    let mut script_path: Option<PathBuf> = None;
+    let mut project_path: Option<PathBuf> = None;
+    for arg in rest {
+        if project_path.is_none() && script_path.is_none() {
+            script_path = Some(PathBuf::from(arg));
+        } else if project_path.is_none() {
+            project_path = Some(PathBuf::from(arg));
+        }
+    }
+    let script_path = script_path.ok_or("usage: opentrack script FILE.rhai PROJECT.otp")?;
+    let project_path = project_path.ok_or("usage: opentrack script FILE.rhai PROJECT.otp")?;
+    let src = std::fs::read_to_string(&script_path)
+        .map_err(|e| format!("read {}: {e}", script_path.display()))?;
+    let mut project = save::load(&project_path).map_err(|e| format!("load: {e}"))?;
+    let before = project
+        .duration()
+        .to_seconds_f64(project.timebase.ticks_per_second);
+    let report =
+        opentrack_engine::script::run(&mut project, &src).map_err(|e| format!("script: {e}"))?;
+    let after = project
+        .duration()
+        .to_seconds_f64(project.timebase.ticks_per_second);
+    // Persist the mutated project back over the input path (scripts that
+    // want a copy call save_otp themselves first).
+    save::save(&project, &project_path).map_err(|e| format!("save: {e}"))?;
+    println!(
+        "script {} applied {} step(s) over {} ({:.3}s -> {:.3}s timeline)",
+        script_path.display(),
+        report.steps,
+        project_path.display(),
+        before,
+        after
+    );
+    for line in &report.log {
+        println!("  script: {line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_render(rest: &[String]) -> Result<ExitCode, String> {
     let mut project_path: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut rate = 48_000u32;
+    let mut video: Option<PathBuf> = None;
+    let mut frames_dir: Option<PathBuf> = None;
+    let mut quality = 85u8;
+    let mut av1 = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -305,6 +359,25 @@ fn cmd_render(rest: &[String]) -> Result<ExitCode, String> {
                     .ok_or("--rate expects HZ")?;
                 i += 2;
             }
+            "--video" => {
+                video = rest.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--frames" => {
+                frames_dir = rest.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--quality" => {
+                quality = rest
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--quality expects 1..100")?;
+                i += 2;
+            }
+            "--export-av1" => {
+                av1 = true;
+                i += 1;
+            }
             other => {
                 if project_path.is_none() {
                     project_path = Some(PathBuf::from(other));
@@ -313,19 +386,97 @@ fn cmd_render(rest: &[String]) -> Result<ExitCode, String> {
             }
         }
     }
-    let project_path =
-        project_path.ok_or("usage: opentrack render PROJECT [-o OUT] [--rate HZ]")?;
+    let project_path = project_path
+        .ok_or("usage: opentrack render PROJECT [-o OUT] [--rate HZ] [--video OUT.avi] [--frames DIR] [--quality N] [--export-av1]")?;
     let project = save::load(&project_path).map_err(|e| format!("load: {e}"))?;
 
     let backends = default_backends();
-    let job = RenderJob::new(project);
-    let job = RenderJob {
-        settings: RenderSettings {
-            sample_rate: rate,
-            ..RenderSettings::default()
-        },
-        ..job
-    };
+    let mut job = RenderJob::new(project);
+    job.settings.sample_rate = rate;
+
+    // Video path (M3): composite → JPEG → AVI/MJPEG (+ PNG stills + WAV).
+    if let Some(avi_path) = &video {
+        let opts = opentrack_engine::VideoRenderOptions {
+            jpeg_quality: quality,
+            frames_dir: frames_dir.clone(),
+            audio_wav: Some(
+                out.clone()
+                    .unwrap_or_else(|| avi_path.with_extension("wav")),
+            ),
+            quiet: false,
+        };
+        let stats = job
+            .run_video(&backends, avi_path, &opts, &mut |f| {
+                eprint!("\rrendering... {:.0}%", f * 100.0);
+            })
+            .map_err(|e| format!("video render: {e}"))?;
+        eprintln!();
+        let expect = (stats.duration_secs * job.project.video.fps()).ceil() as u64;
+        println!(
+            "video {} ({}x{}, {} frames = {:.3}s × {} fps{}), audio {} frames",
+            avi_path.display(),
+            stats.width,
+            stats.height,
+            stats.frames,
+            stats.duration_secs,
+            job.project.video.fps(),
+            if stats.frames == expect {
+                ""
+            } else {
+                " FRAME COUNT MISMATCH"
+            },
+            stats.audio_frames.unwrap_or(0)
+        );
+        for issue in &stats.issues {
+            eprintln!("warning: {issue}");
+        }
+        if stats.frames != expect {
+            return Err(format!(
+                "frame-count acceptance failed: {} != ceil({:.3} × {})",
+                stats.frames,
+                stats.duration_secs,
+                job.project.video.fps()
+            ));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // AV1 export (feature-gated).
+    #[cfg(feature = "export-av1")]
+    if av1 {
+        let opts = opentrack_engine::VideoRenderOptions {
+            jpeg_quality: quality,
+            frames_dir: frames_dir.clone(),
+            audio_wav: None,
+            quiet: false,
+        };
+        let ivf = out
+            .clone()
+            .unwrap_or_else(|| project_path.with_extension("ivf"));
+        let stats = job
+            .run_video_av1(&ivf, &opts, 6, &mut |f| {
+                eprint!("\rencoding AV1... {:.0}%", f * 100.0);
+            })
+            .map_err(|e| format!("av1 render: {e}"))?;
+        eprintln!();
+        println!(
+            "av1 {} ({}x{}, {} frames)",
+            ivf.display(),
+            stats.width,
+            stats.height,
+            stats.frames
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    #[cfg(not(feature = "export-av1"))]
+    if av1 {
+        return Err(
+            "--export-av1 requires a build with --features export-av1 (default builds stay pure)"
+                .into(),
+        );
+    }
+    let _ = (av1, frames_dir, quality);
+
     let rendered = job
         .run_audio(&backends, &mut |_| {})
         .map_err(|e| format!("render: {e}"))?;

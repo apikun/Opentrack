@@ -1,10 +1,10 @@
 //! # opentrack-app — the OpenTrack GUI (egui / eframe)
 //!
-//! M1 scope: the timeline became an *editor* — pointer drag to move and trim
-//! events (with snapping), alt-drag to slip, `S` splits at the playhead,
-//! `Delete` ripple-deletes, track strips carry gain/pan/mute/solo, the media
-//! pool imports via drag & drop, and a preview pane decodes video under the
-//! playhead through the pure-Rust H.264 path (RFC-0005 / RFC-0007).
+//! M1 made the timeline an *editor*; M2 added realtime audio; M3 replaces
+//! the single-clip preview with the full **composited** video preview (all
+//! video tracks, opacity/blend/fades, preview scale 1/1–1/4 — RFC-0007);
+//! M4 adds the per-track **FX rack** (add/reorder/bypass, parameter sliders,
+//! factory presets, automation points — RFC-0004/RFC-0005).
 //! Everything mutates the model through `Session` `EditOp`s — undo/redo is
 //! exact (Ctrl+Z / Ctrl+Y).
 
@@ -12,11 +12,12 @@
 
 use eframe::egui;
 use opentrack_core::edit::{Session, SnapOptions, snap_time};
+use opentrack_core::fx::{FxInstance, FxValue};
 use opentrack_core::save;
 use opentrack_core::timeline::AudioTrackProps;
 use opentrack_core::undo::EditOp;
 use opentrack_core::{EventId, MediaId, MediaKind, Project, Ticks, TrackId, TrackKind};
-use opentrack_engine::VideoDecoder;
+use opentrack_engine::{Compositor, PreviewScale};
 mod engine;
 use engine::AudioEngine;
 use std::collections::HashMap;
@@ -37,7 +38,7 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
     eframe::run_native(
-        "OpenTrack - clean-room Rust NLE (M2)",
+        "OpenTrack - clean-room Rust NLE (M5)",
         options,
         Box::new(move |_cc| Ok(Box::new(OpenTrackApp::new(project_arg)))),
     )
@@ -107,13 +108,13 @@ impl DragState {
     }
 }
 
-/// One decoded-video texture plus the decoder feeding it.
-struct PreviewPane {
-    media: MediaId,
-    label: String,
-    dec: VideoDecoder,
+/// The composited video preview (M3): one egui texture fed by the CPU
+/// compositor, which owns the per-media decoder pool + shared frame cache.
+struct VideoPreview {
+    comp: Compositor,
     tex: egui::TextureHandle,
     tex_key: String,
+    tex_revision: u64,
     err: Option<String>,
 }
 
@@ -155,7 +156,9 @@ struct OpenTrackApp {
     toast: Option<(String, f64)>,
     snap: bool,
     ripple: bool,
-    preview: Option<PreviewPane>,
+    preview: Option<VideoPreview>,
+    preview_scale: PreviewScale,
+    fx_track: Option<TrackId>,
     pool_selection: Option<MediaId>,
     gain_drag: HashMap<TrackId, f32>,
     pan_drag: HashMap<TrackId, f32>,
@@ -191,6 +194,8 @@ impl OpenTrackApp {
             snap: true,
             ripple: true,
             preview: None,
+            preview_scale: PreviewScale::Full,
+            fx_track: None,
             pool_selection: None,
             gain_drag: HashMap::new(),
             pan_drag: HashMap::new(),
@@ -403,9 +408,9 @@ impl OpenTrackApp {
             })
         });
         let kind = audio.or_else(|| {
-            // 2) video through the pure-Rust MP4/H.264 probe?
-            VideoDecoder::open(path).ok().map(|dec| {
-                let v = dec.info().clone();
+            // 2) video through the pure-Rust probe (MP4/H.264 + MJPEG AVI),
+            //    ffmpeg bridge fallback handled inside.
+            opentrack_engine::probe_video_any(path).ok().map(|v| {
                 let fps = if v.fps > 0.5 { v.fps } else { 30.0 };
                 MediaKind::Video {
                     width: v.width,
@@ -609,83 +614,50 @@ impl OpenTrackApp {
     // ---- video preview ---------------------------------------------------
 
     /// The video event under the playhead: (media, label, source seconds).
-    fn video_target(&self) -> Option<(MediaId, String, f64)> {
-        let tps = self.tps();
-        let ph = self.playhead_ticks();
-        for t in self.project().tracks.iter().filter(|t| t.is_video()) {
-            for ev in &t.events {
-                if ev.covers(ph) {
-                    let rel = Ticks(ph.0 - ev.start.0);
-                    let src = Ticks(ev.media_in.0 + rel.0).to_seconds_f64(tps);
-                    return Some((ev.media, ev.label.clone(), src));
-                }
-            }
-        }
-        None
-    }
-
+    /// Composites the video frame under the playhead into the preview
+    /// texture (M3): every video track, opacity/blend/fades, preview scale.
     fn sync_preview(&mut self, ctx: &egui::Context) {
-        let target = self.video_target();
-        let media = target.as_ref().map(|(m, _, _)| *m);
+        let tick = self.playhead_ticks().0;
+        let rev = self.session.history.revision();
 
-        // Drop the pane when no video event is under the playhead.
-        if media.is_none() {
-            self.preview = None;
-            return;
+        // (Re)create the preview state on first use.
+        if self.preview.is_none() {
+            let tex = ctx.load_texture(
+                "video_preview",
+                egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
+                egui::TextureOptions::LINEAR,
+            );
+            self.preview = Some(VideoPreview {
+                comp: Compositor::new(),
+                tex,
+                tex_key: String::new(),
+                tex_revision: u64::MAX,
+                err: None,
+            });
         }
-
-        // Re-open the decoder when the media under the playhead changed.
-        let reopen = !matches!(&self.preview, Some(p) if Some(p.media) == media);
-        if reopen {
-            self.preview = None;
-            let asset = media.and_then(|m| self.project().media(m).cloned());
-            if let (Some((_, label, _)), Some(asset)) = (target.clone(), asset) {
-                match VideoDecoder::open(&asset.path) {
-                    Ok(dec) => {
-                        let tex = ctx.load_texture(
-                            "video_preview",
-                            egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
-                            egui::TextureOptions::LINEAR,
-                        );
-                        self.preview = Some(PreviewPane {
-                            media: asset.id,
-                            label,
-                            dec,
-                            tex,
-                            tex_key: String::new(),
-                            err: None,
-                        });
-                    }
-                    Err(e) => {
-                        if let Some(p) = &mut self.preview {
-                            p.err = Some(format!("open: {e}"));
-                        }
-                    }
-                }
-            }
+        let p = self.preview.as_mut().unwrap();
+        if rev != p.tex_revision {
+            // Edits changed the project: drop pooled decoders/stills so
+            // reopened media never goes stale.
+            p.comp.reset();
+            p.tex_revision = rev;
         }
+        p.comp.set_scale(self.preview_scale);
 
-        if let (Some(p), Some((_, _, src))) = (&mut self.preview, target) {
-            // Quantize the source time to whole source frames so the decoder
-            // cache hits while scrubbing.
-            let info = p.dec.info();
-            let fps = if info.fps > 0.5 { info.fps } else { 30.0 };
-            let q = (src * fps).round() / fps;
-            let key = format!("{:.3}", q);
-            if p.tex_key != key {
-                match p.dec.decode_at(q) {
-                    Ok(frame) => {
-                        let img = egui::ColorImage::from_rgba_unmultiplied(
-                            [frame.width as usize, frame.height as usize],
-                            &frame.rgba,
-                        );
-                        p.tex.set(img, egui::TextureOptions::LINEAR);
-                        p.tex_key = key;
-                        p.err = None;
-                    }
-                    Err(e) => p.err = Some(format!("decode: {e}")),
-                }
-            }
+        let frame = p.comp.composite(&self.session.project, tick);
+        if !p.comp.issues.is_empty() {
+            p.err = Some(p.comp.issues.join("; "));
+        } else {
+            p.err = None;
+        }
+        let key = format!("{tick}/{:?}", self.preview_scale);
+        if p.tex_key != key {
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba,
+            );
+            p.tex.set(img, egui::TextureOptions::LINEAR);
+            p.tex_key = key;
         }
     }
 
@@ -1065,6 +1037,10 @@ impl OpenTrackApp {
                 ui.separator();
                 self.draw_preview_body(ui);
                 ui.add_space(6.0);
+                ui.heading("FX Rack");
+                ui.separator();
+                self.draw_fx_body(ui, ctx);
+                ui.add_space(6.0);
                 ui.heading("Media Pool");
                 ui.separator();
                 place = self.draw_pool_body(ui);
@@ -1075,6 +1051,14 @@ impl OpenTrackApp {
     }
 
     fn draw_preview_body(&mut self, ui: &mut egui::Ui) {
+        let scale = self.preview_scale;
+        if ui.button(format!("scale 1/{}", scale.divisor())).clicked() {
+            self.preview_scale = scale.next();
+            if let Some(p) = &mut self.preview {
+                p.tex_key.clear(); // force re-upload at the new size
+            }
+        }
+        ui.separator();
         match &mut self.preview {
             Some(p) => {
                 let avail = ui.available_width();
@@ -1086,20 +1070,347 @@ impl OpenTrackApp {
                         .max_size(egui::vec2(avail, PREVIEW_MAX_H))
                         .shrink_to_fit(),
                 );
-                let src = p.tex_key.parse::<f64>().unwrap_or(0.0) / 1000.0;
+                let (decoded, hits, dropped) = {
+                    let st = p.comp.stats();
+                    (st.decoded, st.cache_hits, st.dropped)
+                };
+                let [tw, th] = p.tex.size();
                 ui.small(format!(
-                    "{} | source {src:.2}s | {} {}x{}",
-                    p.label,
-                    p.dec.info().codec,
-                    p.dec.info().width,
-                    p.dec.info().height
+                    "composited {tw}x{th} | decoded {decoded} | cache {hits} | dropped {dropped}",
                 ));
+                ui.small("All video tracks, top-down, with opacity/blend/fades.");
             }
             None => {
                 ui.label("No video under the playhead.");
-                ui.small("Drop an .mp4/.mov (H.264) file anywhere to import,");
-                ui.small("place it on a video track, then scrub the ruler.");
+                ui.small("Drop .mp4/.mov (H.264), .avi (MJPEG) or PNG/JPEG/BMP");
+                ui.small("files anywhere, place them on video tracks, scrub.");
             }
+        }
+    }
+
+    /// M4 FX rack: per-track chain (add / reorder / bypass / remove),
+    /// parameter sliders from the descriptor table, factory presets and
+    /// automation points. Every change goes through a reversible `EditOp`.
+    fn draw_fx_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.fx_track.is_none() {
+            self.fx_track = self.session.project.tracks.first().map(|t| t.id);
+        }
+        let track_ids: Vec<(TrackId, String)> = self
+            .session
+            .project
+            .tracks
+            .iter()
+            .map(|t| (t.id, t.name.clone()))
+            .collect();
+        egui::ComboBox::from_id_salt("fx_track_pick")
+            .selected_text(
+                track_ids
+                    .iter()
+                    .find(|(id, _)| Some(*id) == self.fx_track)
+                    .map(|(_, n)| n.as_str())
+                    .unwrap_or("<track>"),
+            )
+            .show_ui(ui, |ui| {
+                for (id, name) in &track_ids {
+                    ui.selectable_value(&mut self.fx_track, Some(*id), name);
+                }
+            });
+        let Some(track_id) = self.fx_track else {
+            return;
+        };
+        let Some(track) = self.session.project.track(track_id) else {
+            return;
+        };
+        let domain = if track.is_video() {
+            opentrack_core::fx::Domain::Video
+        } else {
+            opentrack_core::fx::Domain::Audio
+        };
+        let chain = track.fx_chain.clone();
+        if chain.instances.is_empty() {
+            ui.small("Empty chain — add an effect below.");
+        }
+        for (i, fx) in chain.instances.iter().enumerate() {
+            ui.push_id(("fxrow", i), |ui| {
+                egui::CollapsingHeader::new(format!(
+                    "{}. {}{}",
+                    i + 1,
+                    opentrack_core::fx::builtin::descriptor(&fx.kind)
+                        .map(|d| d.label)
+                        .unwrap_or(&fx.kind),
+                    if fx.enabled { "" } else { " (bypassed)" }
+                ))
+                .default_open(i == 0)
+                .show(ui, |ui| {
+                    // enable / reorder / remove row
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(fx.enabled, "on").clicked() {
+                            let mut new = fx.clone();
+                            new.enabled = !new.enabled;
+                            self.exec(
+                                ctx,
+                                EditOp::SetFx {
+                                    track: track_id,
+                                    index: i,
+                                    old: fx.clone(),
+                                    new,
+                                },
+                            );
+                        }
+                        if ui.button("↑").clicked() && i > 0 {
+                            self.exec(
+                                ctx,
+                                EditOp::MoveFx {
+                                    track: track_id,
+                                    from: i,
+                                    to: i - 1,
+                                },
+                            );
+                        }
+                        if ui.button("↓").clicked() && i + 1 < chain.instances.len() {
+                            self.exec(
+                                ctx,
+                                EditOp::MoveFx {
+                                    track: track_id,
+                                    from: i,
+                                    to: i + 1,
+                                },
+                            );
+                        }
+                        if ui.button("remove").clicked() {
+                            self.exec(
+                                ctx,
+                                EditOp::RemoveFx {
+                                    track: track_id,
+                                    index: i,
+                                    instance: fx.clone(),
+                                },
+                            );
+                        }
+                    });
+                    // presets
+                    let presets = opentrack_core::fx::presets::for_kind(&fx.kind);
+                    if !presets.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("preset:");
+                            for (name, map) in &presets {
+                                if ui.small_button(*name).clicked() {
+                                    let mut new = fx.clone();
+                                    for (k, v) in map {
+                                        new.params.insert(k.clone(), v.clone());
+                                    }
+                                    self.exec(
+                                        ctx,
+                                        EditOp::SetFx {
+                                            track: track_id,
+                                            index: i,
+                                            old: fx.clone(),
+                                            new,
+                                        },
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    // parameters (+ automation)
+                    if let Some(desc) = opentrack_core::fx::builtin::descriptor(&fx.kind) {
+                        for spec in desc.params {
+                            self.draw_fx_param(
+                                ui,
+                                ctx,
+                                track_id,
+                                i,
+                                fx,
+                                spec,
+                                &format!("fx{i}{}", spec.name),
+                            );
+                        }
+                    }
+                });
+            });
+        }
+        // add-FX picker
+        let options = opentrack_core::fx::builtin::in_domain(domain);
+        ui.add_space(4.0);
+        egui::ComboBox::from_id_salt("fx_add_pick")
+            .selected_text("add effect…")
+            .show_ui(ui, |ui| {
+                for d in options {
+                    if ui.selectable_label(false, d.label).clicked() {
+                        self.exec(
+                            ctx,
+                            EditOp::AddFx {
+                                track: track_id,
+                                index: usize::MAX, // clamped to "append" on apply
+                                instance: FxInstance::with_defaults(d.kind)
+                                    .unwrap_or_else(|| unreachable!("registry kind")),
+                            },
+                        );
+                    }
+                }
+            });
+    }
+
+    /// One parameter row: slider from the spec, plus automation controls.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_fx_param(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        track_id: TrackId,
+        fx_index: usize,
+        fx: &FxInstance,
+        spec: &opentrack_core::fx::ParamSpec,
+        id_salt: &str,
+    ) {
+        let tps = self.tps();
+        let playhead = self.playhead_ticks().0;
+        ui.horizontal(|ui| {
+            ui.add_sized([86.0, 18.0], egui::Label::new(spec.name));
+            match fx.params.get(spec.name) {
+                Some(FxValue::Float(v)) => {
+                    let mut nv = *v;
+                    let r = egui::DragValue::new(&mut nv)
+                        .speed(0.05)
+                        .range(spec.min.unwrap_or(-999.0)..=spec.max.unwrap_or(999.0));
+                    if ui.add(r).changed() {
+                        let mut new = fx.clone();
+                        new.params.insert(spec.name.to_string(), FxValue::Float(nv));
+                        self.exec(
+                            ctx,
+                            EditOp::SetFx {
+                                track: track_id,
+                                index: fx_index,
+                                old: fx.clone(),
+                                new,
+                            },
+                        );
+                    }
+                }
+                Some(FxValue::Int(v)) => {
+                    let mut nv = *v;
+                    if ui.add(egui::DragValue::new(&mut nv)).changed() {
+                        let mut new = fx.clone();
+                        new.params.insert(spec.name.to_string(), FxValue::Int(nv));
+                        self.exec(
+                            ctx,
+                            EditOp::SetFx {
+                                track: track_id,
+                                index: fx_index,
+                                old: fx.clone(),
+                                new,
+                            },
+                        );
+                    }
+                }
+                Some(FxValue::Bool(v)) => {
+                    let mut nv = *v;
+                    if ui.checkbox(&mut nv, "").changed() {
+                        let mut new = fx.clone();
+                        new.params.insert(spec.name.to_string(), FxValue::Bool(nv));
+                        self.exec(
+                            ctx,
+                            EditOp::SetFx {
+                                track: track_id,
+                                index: fx_index,
+                                old: fx.clone(),
+                                new,
+                            },
+                        );
+                    }
+                }
+                Some(FxValue::Text(v)) => {
+                    ui.small(v.clone());
+                }
+                None => {}
+            }
+            // automation toggle (numeric params only)
+            if spec.default.as_f32().is_some() {
+                let mut has_lane = fx.automation.contains_key(spec.name);
+                if ui
+                    .toggle_value(&mut has_lane, "A")
+                    .on_hover_text("automation lane")
+                    .clicked()
+                {
+                    if has_lane {
+                        let mut new = fx.clone();
+                        new.automation.remove(spec.name);
+                        self.exec(
+                            ctx,
+                            EditOp::SetFx {
+                                track: track_id,
+                                index: fx_index,
+                                old: fx.clone(),
+                                new,
+                            },
+                        );
+                    } else {
+                        // seed the lane with one point at the playhead
+                        let seed = fx.value_at(spec.name, playhead).unwrap_or(0.0);
+                        let mut new = fx.clone();
+                        let mut lane = opentrack_core::fx::AutomationLane::default();
+                        lane.insert(playhead, seed);
+                        new.automation.insert(spec.name.to_string(), lane);
+                        self.exec(
+                            ctx,
+                            EditOp::SetFx {
+                                track: track_id,
+                                index: fx_index,
+                                old: fx.clone(),
+                                new,
+                            },
+                        );
+                    }
+                }
+            }
+        });
+        // lane points editor
+        if let Some(lane) = fx.automation.get(spec.name)
+            && !lane.is_empty()
+        {
+            ui.indent(id_salt, |ui| {
+                ui.horizontal(|ui| {
+                    ui.small(format!(
+                        "{} pt(s) @ playhead {:.3}",
+                        lane.sample(playhead).unwrap_or(0.0),
+                        playhead as f64 / tps as f64
+                    ));
+                    if ui.small_button("+ here").clicked() {
+                        let v = lane.sample(playhead).unwrap_or(0.0);
+                        self.exec(
+                            ctx,
+                            EditOp::SetAutoPoint {
+                                track: track_id,
+                                fx_index,
+                                param: spec.name.to_string(),
+                                old_point: None,
+                                new_point: Some((playhead, v)),
+                            },
+                        );
+                    }
+                });
+                for pt in &lane.points {
+                    ui.horizontal(|ui| {
+                        ui.small(format!(
+                            "{:>7.3}s → {:>7.3}",
+                            pt.tick as f64 / tps as f64,
+                            pt.value
+                        ));
+                        if ui.small_button("×").clicked() {
+                            self.exec(
+                                ctx,
+                                EditOp::SetAutoPoint {
+                                    track: track_id,
+                                    fx_index,
+                                    param: spec.name.to_string(),
+                                    old_point: Some((pt.tick, pt.value)),
+                                    new_point: None,
+                                },
+                            );
+                        }
+                    });
+                }
+            });
         }
     }
 

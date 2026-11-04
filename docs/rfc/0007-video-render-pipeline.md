@@ -1,6 +1,6 @@
 - RFC: 0007
 - Title: Video compositing & render pipeline
-- Status: Draft (target milestone M3) — decode half shipped early in M1 (0.2.0)
+- Status: Implemented (0.4.0) — decode shipped early in M1 (0.2.0); compositor, render pipeline and frame-count acceptance shipped in M3 (0.4.0)
 
 ## Summary
 

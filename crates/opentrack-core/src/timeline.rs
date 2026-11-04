@@ -168,6 +168,10 @@ pub struct Track {
     pub events: Vec<Event>,
     /// Locked tracks reject edits (enforced by `opentrack-core::edit`).
     pub locked: bool,
+    /// FX chain applied to the track bus (audio) / composited output
+    /// (video), in processing order (M4).
+    #[serde(default)]
+    pub fx_chain: crate::fx::FxChain,
 }
 
 impl Track {
@@ -235,6 +239,7 @@ mod tests {
             }),
             events: vec![],
             locked: false,
+            fx_chain: Default::default(),
         };
         assert!(audio(false, false).audible(false));
         assert!(!audio(false, false).audible(true)); // someone else solos

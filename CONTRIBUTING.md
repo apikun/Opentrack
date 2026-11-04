@@ -72,3 +72,16 @@ can (they are plain JSON — redact paths you care about).
 Report vulnerabilities privately to the maintainers (see the repo contact in
 the README) rather than filing a public issue. Timeline/render bugs that
 crash the app are regular issues.
+
+## Packaging (M5)
+
+From a clean clone, one command builds the release and packages an
+installer for the host platform:
+
+```bash
+cargo xtask installer      # or: cargo run -p xtask -- installer
+```
+
+Windows additionally ships WiX/MSIX scaffolding under `packaging/windows/`
+(`make-msix.ps1` needs the Windows SDK); macOS signing/notarization steps
+are documented in `packaging/macos/README.md`.

@@ -130,6 +130,59 @@ pub enum EditOp {
         /// Master state after the op.
         new: AudioBus,
     },
+    /// Insert an FX instance into a track's chain at `index` (M4).
+    AddFx {
+        /// Owning track.
+        track: TrackId,
+        /// Chain position to insert at (clamped on apply).
+        index: usize,
+        /// The instance to insert.
+        instance: crate::fx::FxInstance,
+    },
+    /// Remove an FX instance from a track's chain (payload stores it for
+    /// revert) (M4).
+    RemoveFx {
+        /// Owning track.
+        track: TrackId,
+        /// Chain position the instance was removed from.
+        index: usize,
+        /// The removed instance.
+        instance: crate::fx::FxInstance,
+    },
+    /// Replace one FX instance wholesale (params, enabled flag) (M4).
+    SetFx {
+        /// Owning track.
+        track: TrackId,
+        /// Chain position.
+        index: usize,
+        /// Instance before the op.
+        old: crate::fx::FxInstance,
+        /// Instance after the op.
+        new: crate::fx::FxInstance,
+    },
+    /// Reorder an FX instance within its chain (M4).
+    MoveFx {
+        /// Owning track.
+        track: TrackId,
+        /// Chain position before the op.
+        from: usize,
+        /// Chain position after the op.
+        to: usize,
+    },
+    /// Add / replace / remove one automation point on an FX parameter
+    /// (`new_point: None` removes) (M4).
+    SetAutoPoint {
+        /// Owning track.
+        track: TrackId,
+        /// Chain position of the FX instance.
+        fx_index: usize,
+        /// Parameter key.
+        param: String,
+        /// The point before the op (None = no point at that tick).
+        old_point: Option<(i64, f32)>,
+        /// The point after the op (None = removed).
+        new_point: Option<(i64, f32)>,
+    },
 }
 
 impl EditOp {
@@ -147,6 +200,11 @@ impl EditOp {
             EditOp::RippleDelete { .. } => "Ripple Delete",
             EditOp::SetAudioTrackProps { .. } => "Track Volume/Pan",
             EditOp::SetMaster { .. } => "Master Bus",
+            EditOp::AddFx { .. } => "Add FX",
+            EditOp::RemoveFx { .. } => "Remove FX",
+            EditOp::SetFx { .. } => "FX Parameters",
+            EditOp::MoveFx { .. } => "Reorder FX",
+            EditOp::SetAutoPoint { .. } => "Automation Point",
         }
     }
 
@@ -252,6 +310,64 @@ impl EditOp {
                 }
             }
             EditOp::SetMaster { new, .. } => p.master = new,
+            EditOp::AddFx {
+                track,
+                index,
+                instance,
+            } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                let i = index.min(t.fx_chain.instances.len());
+                t.fx_chain.instances.insert(i, instance);
+            }
+            EditOp::RemoveFx { track, index, .. } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                if index >= t.fx_chain.instances.len() {
+                    return Err(EditError::StaleOp);
+                }
+                t.fx_chain.instances.remove(index);
+            }
+            EditOp::SetFx {
+                track, index, new, ..
+            } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                let Some(fx) = t.fx_chain.instances.get_mut(index) else {
+                    return Err(EditError::StaleOp);
+                };
+                *fx = new;
+            }
+            EditOp::MoveFx { track, from, to } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                let n = t.fx_chain.instances.len();
+                if from >= n || to >= n {
+                    return Err(EditError::StaleOp);
+                }
+                let fx = t.fx_chain.instances.remove(from);
+                t.fx_chain.instances.insert(to, fx);
+            }
+            EditOp::SetAutoPoint {
+                track,
+                fx_index,
+                param,
+                old_point,
+                new_point,
+            } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                let Some(fx) = t.fx_chain.instances.get_mut(fx_index) else {
+                    return Err(EditError::StaleOp);
+                };
+                let lane = fx.automation.entry(param).or_default();
+                match new_point {
+                    Some((tick, value)) => lane.insert(tick, value),
+                    None => {
+                        let Some((tick, _)) = old_point else {
+                            return Err(EditError::StaleOp);
+                        };
+                        if !lane.remove(tick) {
+                            return Err(EditError::StaleOp);
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -354,6 +470,68 @@ impl EditOp {
                 }
             }
             EditOp::SetMaster { old, .. } => p.master = old,
+            EditOp::AddFx {
+                track,
+                index,
+                instance,
+            } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                if index >= t.fx_chain.instances.len() || t.fx_chain.instances[index] != instance {
+                    return Err(EditError::StaleOp);
+                }
+                t.fx_chain.instances.remove(index);
+            }
+            EditOp::RemoveFx {
+                track,
+                index,
+                instance,
+            } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                let i = index.min(t.fx_chain.instances.len());
+                t.fx_chain.instances.insert(i, instance);
+            }
+            EditOp::SetFx {
+                track, index, old, ..
+            } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                let Some(fx) = t.fx_chain.instances.get_mut(index) else {
+                    return Err(EditError::StaleOp);
+                };
+                *fx = old;
+            }
+            EditOp::MoveFx { track, from, to } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                let n = t.fx_chain.instances.len();
+                if from >= n || to >= n {
+                    return Err(EditError::StaleOp);
+                }
+                let fx = t.fx_chain.instances.remove(to);
+                t.fx_chain.instances.insert(from, fx);
+            }
+            EditOp::SetAutoPoint {
+                track,
+                fx_index,
+                param,
+                old_point,
+                new_point,
+            } => {
+                let t = p.track_mut(track).ok_or(EditError::TrackNotFound(track))?;
+                let Some(fx) = t.fx_chain.instances.get_mut(fx_index) else {
+                    return Err(EditError::StaleOp);
+                };
+                let lane = fx.automation.entry(param).or_default();
+                match old_point {
+                    Some((tick, value)) => lane.insert(tick, value),
+                    None => {
+                        let Some((tick, _)) = new_point else {
+                            return Err(EditError::StaleOp);
+                        };
+                        if !lane.remove(tick) {
+                            return Err(EditError::StaleOp);
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -462,6 +640,7 @@ mod tests {
                 kind: TrackKind::Audio(Default::default()),
                 events: vec![],
                 locked: false,
+                fx_chain: Default::default(),
             },
         }
     }

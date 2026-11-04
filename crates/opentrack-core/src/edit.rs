@@ -45,6 +45,12 @@ pub enum EditError {
     /// A stored op no longer matches project state (id drift).
     #[error("operation is stale")]
     StaleOp,
+    /// FX registry key does not exist.
+    #[error("unknown FX kind `{0}`")]
+    UnknownFxKind(String),
+    /// Chain position is out of bounds.
+    #[error("FX chain index {0} out of bounds")]
+    FxIndexOutOfBounds(usize),
 }
 
 /// Snapping configuration (Vegas-style: grid + event edges).
@@ -220,6 +226,7 @@ impl Session {
             kind,
             events: Vec::new(),
             locked: false,
+            fx_chain: Default::default(),
         };
         let index = index.unwrap_or(0);
         self.exec(EditOp::AddTrack { index, track })?;
@@ -521,6 +528,126 @@ impl Session {
     pub fn set_master(&mut self, master: crate::bus::AudioBus) -> Result<(), EditError> {
         let old = self.project.master.clone();
         self.exec(EditOp::SetMaster { old, new: master })?;
+        Ok(())
+    }
+
+    // ---- M4: FX chains & automation ---------------------------------------
+
+    fn fx_track_mut(&mut self, track: TrackId) -> Result<&mut Track, EditError> {
+        let t = self
+            .project
+            .track_mut(track)
+            .ok_or(EditError::TrackNotFound(track))?;
+        if t.locked {
+            return Err(EditError::TrackLocked);
+        }
+        Ok(t)
+    }
+
+    /// Adds an FX instance (by registry kind, with defaults) to a track's
+    /// chain at the end. Rejected for unknown kinds.
+    pub fn add_fx(&mut self, track: TrackId, kind: &str) -> Result<(), EditError> {
+        let Some(instance) = crate::fx::FxInstance::with_defaults(kind) else {
+            return Err(EditError::UnknownFxKind(kind.to_string()));
+        };
+        let t = self.fx_track_mut(track)?;
+        let index = t.fx_chain.instances.len();
+        self.exec(EditOp::AddFx {
+            track,
+            index,
+            instance,
+        })?;
+        Ok(())
+    }
+
+    /// Removes the FX instance at chain position `index`.
+    pub fn remove_fx(&mut self, track: TrackId, index: usize) -> Result<(), EditError> {
+        let t = self.fx_track_mut(track)?;
+        let Some(instance) = t.fx_chain.instances.get(index).cloned() else {
+            return Err(EditError::FxIndexOutOfBounds(index));
+        };
+        self.exec(EditOp::RemoveFx {
+            track,
+            index,
+            instance,
+        })?;
+        Ok(())
+    }
+
+    /// Replaces one FX instance's parameters / enabled flag.
+    pub fn set_fx(
+        &mut self,
+        track: TrackId,
+        index: usize,
+        new: crate::fx::FxInstance,
+    ) -> Result<(), EditError> {
+        let t = self
+            .project
+            .track(track)
+            .ok_or(EditError::TrackNotFound(track))?;
+        let Some(old) = t.fx_chain.instances.get(index).cloned() else {
+            return Err(EditError::StaleOp);
+        };
+        if t.locked {
+            return Err(EditError::TrackLocked);
+        }
+        self.exec(EditOp::SetFx {
+            track,
+            index,
+            old,
+            new,
+        })?;
+        Ok(())
+    }
+
+    /// Moves an FX instance from chain position `from` to `to`.
+    pub fn move_fx(&mut self, track: TrackId, from: usize, to: usize) -> Result<(), EditError> {
+        let t = self
+            .project
+            .track(track)
+            .ok_or(EditError::TrackNotFound(track))?;
+        let n = t.fx_chain.instances.len();
+        if t.locked {
+            return Err(EditError::TrackLocked);
+        }
+        if from >= n || to >= n {
+            return Err(EditError::StaleOp);
+        }
+        self.exec(EditOp::MoveFx { track, from, to })?;
+        Ok(())
+    }
+
+    /// Adds / replaces / removes one automation point on an FX parameter.
+    pub fn set_auto_point(
+        &mut self,
+        track: TrackId,
+        fx_index: usize,
+        param: &str,
+        tick: i64,
+        value: Option<f32>,
+    ) -> Result<(), EditError> {
+        let t = self
+            .project
+            .track(track)
+            .ok_or(EditError::TrackNotFound(track))?;
+        let Some(fx) = t.fx_chain.instances.get(fx_index) else {
+            return Err(EditError::StaleOp);
+        };
+        let old_point = fx
+            .automation
+            .get(param)
+            .and_then(|lane| lane.points.iter().find(|p| p.tick == tick))
+            .map(|p| (p.tick, p.value));
+        if t.locked {
+            return Err(EditError::TrackLocked);
+        }
+        self.exec(EditOp::SetAutoPoint {
+            track,
+            fx_index,
+            param: param.to_string(),
+            old_point,
+            new_point: value.map(|v| (tick, v)),
+        })?;
         Ok(())
     }
 }

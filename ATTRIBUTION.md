@@ -44,3 +44,42 @@ proprietary NLE.
   the user has them installed, `opentrack-engine::backend_ffmpeg` shells out
   for formats the pure-Rust path does not cover. Without them OpenTrack
   still builds, tests and renders.
+
+## zune-jpeg + zune-core
+
+- **Source:** <https://github.com/etemesi254/zune-image> (crates
+  `zune-jpeg`, `zune-core`).
+- **Used for:** baseline JPEG decoding in the M3 video pipeline (MJPEG-AVI
+  frames and JPEG stills → RGBA8).
+- **License:** MIT OR Apache-2.0.
+- **Version:** 0.5.x (see `Cargo.lock` for the exact build).
+
+## jpeg-encoder
+
+- **Source:** <https://github.com/vstroebel/jpeg-encoder>.
+- **Used for:** baseline JPEG encoding for the pure-Rust AVI/MJPEG export.
+- **License:** MIT OR Apache-2.0.
+- **Version:** 0.6.x.
+
+## png
+
+- **Source:** <https://github.com/image-rs/image-png>.
+- **Used for:** PNG still decode (compositor) and PNG frame export (render
+  pipeline).
+- **License:** MIT OR Apache-2.0.
+- **Version:** 0.18.x.
+
+## rhai
+
+- **Source:** <https://github.com/rhaiscript/rhai>.
+- **Used for:** the project-level scripting surface (RFC-0010), sandboxed
+  VM, `sync` feature.
+- **License:** MIT OR Apache-2.0.
+- **Version:** 1.19+.
+
+## rav1e (optional, feature `export-av1`)
+
+- **Source:** <https://github.com/xiph/rav1e>.
+- **Used for:** optional AV1 export (RFC-0007). Not compiled by default;
+  default builds never link it.
+- **License:** BSD-2-Clause.

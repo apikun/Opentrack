@@ -107,6 +107,7 @@ pub fn run(minutes: u32, realtime: bool) -> Result<SmokeReport, String> {
             kind: TrackKind::Audio(Default::default()),
             events,
             locked: false,
+            fx_chain: Default::default(),
         });
     }
 

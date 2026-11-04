@@ -158,6 +158,7 @@ impl Project {
                 kind,
                 events: Vec::new(),
                 locked: false,
+                fx_chain: Default::default(),
             });
         }
         p

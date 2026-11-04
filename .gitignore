@@ -17,3 +17,8 @@ desktop.ini
 .idea/
 .vscode/
 *.swp
+
+# xtask packaging output
+dist/
+# generated docs site (cargo run -p xtask -- site)
+docs/site/

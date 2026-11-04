@@ -10,7 +10,7 @@ assets, no protocol/SDK reimplementation — only publicly observable behavior,
 documented in RFCs, written by and for the open-source community.
 
 - License: **GPL-3.0-or-later** (see [`LICENSE`](LICENSE))
-- Status: **M2 — realtime audio playback** (data model + offline render + interactive editing + pure-Rust H.264 preview + realtime playback with meters and loop transport)
+- Status: **M5 — ecosystem & packaging shipped** (M0 blueprint + M1 interactive editing + M2 realtime audio + M3 video decode/composite/export + M4 FX framework + M5 plugin ABI/scripting/installers — see [`ROADMAP.md`](ROADMAP.md))
 - Platform: **Windows first**, then Linux/macOS (CI matrix in [`.github/workflows/ci.yml`](.github/workflows/ci.yml))
 
 > **Disclaimer** — OpenTrack is not affiliated with, endorsed by, or derived from
@@ -50,8 +50,10 @@ opentrack demo - building a Vegas-style session in opentrack-demo
 | `opentrack demo [DIR]` | Build + render the bundled demo session |
 | `opentrack new NAME [DIR]` | Create an empty project skeleton (`NAME.otp`) |
 | `opentrack probe FILE` | Identify media through the backend chain (pure-Rust first, then ffmpeg) |
-| `opentrack frame FILE [--at SECS] [-o OUT.bmp]` | Decode one video frame to a BMP (pure-Rust H.264, no ffmpeg) |
+| `opentrack frame FILE [--at SECS] [-o OUT.bmp]` | Decode one video frame to a BMP (MP4/H.264 and MJPEG-AVI in pure Rust; bridge for the rest) |
 | `opentrack render PROJECT [-o OUT] [--rate HZ]` | Offline audio render of a project |
+| `opentrack render PROJECT --video OUT.avi [--frames DIR] [--quality N]` | **Video export (M3)**: composited MJPEG-AVI + WAV master (+ optional PNG stills); add `--export-av1` on an `export-av1` feature build |
+| `opentrack script FILE.rhai PROJECT.otp` | Run a project-level batch script (Rhai, M5) |
 | `opentrack smoke [--minutes N] [--realtime]` | Play an 8-track session through the realtime engine — the M2 acceptance profile (zero underruns) |
 | `opentrack gui` | Print how to launch the egui shell |
 
@@ -69,57 +71,72 @@ Release builds (CLI + GUI, Windows first) are attached to every
 
 ```
 crates/
-  opentrack-core     Project/timeline data model, editing ops + undo, buses, .otp I/O
-  opentrack-engine   CodecBackend trait, pure-Rust WAV codec, ffmpeg bridge,
-                     pure-Rust MP4/H.264 video decode, offline mixer,
-                     realtime playback engine (RFC-0008)
-  opentrack-cli      The `opentrack` binary (demo / new / probe / frame / render / smoke)
-  opentrack-app      The egui GUI: interactive timeline, video preview, media pool,
-                     transport + loop + peak meters
+  opentrack-core     Project/timeline data model, editing ops + undo, buses, FX descriptors
+                     + automation lanes, .otp I/O
+  opentrack-engine   CodecBackend trait, pure-Rust WAV codec, ffmpeg bridge, video decode
+                     (VideoDecoder trait: MP4/H.264 + MJPEG-AVI pure Rust, ffmpeg bridge),
+                     CPU compositor, AVI/MJPEG muxer, audio FX + video FX, offline mixer,
+                     realtime playback engine, plugin host (RFC-0009), Rhai scripting (RFC-0010)
+  opentrack-cli      The `opentrack` binary (demo / new / probe / frame / render / script / smoke)
+  opentrack-app      The egui GUI: interactive timeline, composited video preview, FX rack,
+                     media pool, transport + loop + peak meters
+xtask/              `cargo xtask installer` / `cargo xtask site` (M5 packaging automation)
+packaging/          WiX + MSIX (Windows), AppImage assets (Linux), signing runbook (macOS)
 docs/
-  rfc/               RFC 0001-0008: the blueprint proper
-  vegas-parity.md    Feature-by-feature parity matrix vs. the Vegas workflow
+  rfc/               RFC 0001-0011: the blueprint proper
+  tutorials/         The tutorial series
+  vegas-parity.md    Feature-by-feature parity matrix vs. the Vegas workflow (reviewed 0.4.0)
 ARCHITECTURE.md      How the crates fit together
 ROADMAP.md           M0..M5 milestones with acceptance criteria
 CLEANROOM.md         Clean-room & trademark policy (read before contributing)
-ATTRIBUTION.md       Upstream components and licenses (filmcraft-h264, craft-media)
+ATTRIBUTION.md       Upstream components and licenses
 CHANGELOG.md         Release notes per version
 ```
 
-### What already works (M0 + M1 + M2)
+### What already works (M0 → M5)
 
 - **Timeline model**: tracks (video top-down / audio), events with takes, fades,
   media in-points; Vegas-style **split / trim / slip / move / ripple delete** as
   validated, reversible, serializable edit ops with undo/redo (`opentrack-core::edit`).
 - **Interactive editing (M1)**: pointer drag to move, edge-drag to trim,
   alt-drag to slip, `S` to split at the playhead, ripple delete, track strips
-  with gain/pan/mute/solo, master fader, snapping, zoom, full undo/redo —
-  all through the same `Session` op pipeline (`opentrack-app`).
-- **Video preview (M1)**: the pane under the playhead decodes **H.264/MP4
-  in pure Rust** — MP4/MOV demux + AVC decode + YUV→RGBA — no ffmpeg needed.
-  Frame-accurate scrubbing; streaming GOP decode keeps playback O(1) per frame.
+  with gain/pan/mute/solo, master fader, snapping, zoom, full undo/redo.
 - **Realtime audio playback (M2)**: Space plays the mix through the platform
   device (WASAPI/CoreAudio/ALSA) with the same gain/fade/pan math as the
-  offline render; track strips and the master fader update live (lock-free
-  smoothing), peak meters run on every strip and the master, and a loop region
-  (shift+drag the ruler) cycles playback. The audio callback never locks,
-  allocates or decodes (RFC-0008).
+  offline render; lock-free live parameters, peak meters on every strip and
+  the master, loop region (shift+drag the ruler). The audio callback never
+  locks, allocates or decodes (RFC-0008).
+- **Video pipeline (M3)**: `VideoDecoder` trait with pure-Rust MP4/H.264 and
+  **MJPEG-AVI** decode (in-house RIFF walker), ffmpeg bridge for the rest;
+  CPU **compositor** (opacity/blend/fades), shared `(MediaId, frame)` LRU
+  cache; **export** to MJPEG-AVI (pure-Rust muxer) + WAV master with an exact
+  frame-count guarantee, optional PNG stills, optional AV1 (rav1e) behind a
+  feature. The preview shows the composited result at 1/1–1/4 scale.
+- **FX framework (M4)**: 3-band EQ, compressor, limiter, reverb send on every
+  audio track; brightness/contrast, saturation and 1D LUTs on video tracks;
+  **automation lanes** per FX parameter; factory presets; offline/realtime
+  DSP parity proven bit-exact at the f32 stage.
+- **Ecosystem (M5)**: plugin ABI v0 (audio blocks / video frames) with a
+  reference host; Rhai **scripting** (`opentrack script`); one-command
+  installers via **`cargo xtask installer`** (Windows zip + WiX/MSIX
+  scaffolding, Linux AppImage/AppDir, macOS app bundle + dmg).
 - **Snapping**: grid + event-edge snapping with configurable threshold.
 - **Audio bus math**: equal-power pan law, dBFS gain, mute/solo semantics,
   master bus (`opentrack-core::bus`).
-- **Offline audio render**: decode → per-event fades → track gain/pan →
-  master bus → 16-bit PCM WAV, with per-channel peak reporting (`opentrack-engine::mixer`).
+- **Offline audio render**: decode → per-event fades → track FX → track
+  gain/pan → master bus → 16-bit PCM WAV, with per-channel peaks.
 - **Codec abstraction**: `CodecBackend` trait with a zero-dependency pure-Rust
-  WAV backend (PCM 8/16/24/32, float 32/64, extensible) and an optional
-  ffmpeg/ffprobe bridge for everything else.
-- **Project files**: versioned `.otp` JSON with forward-version rejection.
+  WAV backend and an optional ffmpeg/ffprobe bridge for everything else.
+- **Project files**: versioned `.otp` JSON (v2 carries FX chains + automation;
+  v1 loads unchanged) with forward-version rejection.
 
 ### What is deliberately not built yet
 
-Video compositing/multi-clip render and video export (M3), FX DSP (M4/M5),
-multi-select/cross-track moves (M1.1). Every
-gap has an RFC and a milestone:
-see [`ROADMAP.md`](ROADMAP.md) and [`docs/vegas-parity.md`](docs/vegas-parity.md).
+GPU/shader compositing (CPU reference first — optimization RFC after parity
+tests exist), custom bus routing, markers, dynamic plugin loading (RFC-0009
+freezes the v0 contract first), CLAP/VST hosting (research only — RFC-0011),
+HDR. Every gap has an RFC or a note: see [`ROADMAP.md`](ROADMAP.md) and
+[`docs/vegas-parity.md`](docs/vegas-parity.md).
 
 ---
 

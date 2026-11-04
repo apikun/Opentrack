@@ -18,3 +18,7 @@ opentrack-engine = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+# AV1 export passthrough (engine gates rav1e; default builds stay pure).
+export-av1 = ["opentrack-engine/export-av1"]

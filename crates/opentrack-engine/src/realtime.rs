@@ -1555,6 +1555,7 @@ mod tests {
                     label: format!("e{i}"),
                 }],
                 locked: false,
+                fx_chain: Default::default(),
             });
         }
         p

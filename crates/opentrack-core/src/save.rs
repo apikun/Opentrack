@@ -7,7 +7,11 @@ use std::path::Path;
 
 /// Current `.otp` container version. Readers accept any version **lower or
 /// equal** and reject newer ones with [`SaveError::UnsupportedVersion`].
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// v2 (0.4.0): tracks carry `fx_chain` (instances + automation lanes). v1
+/// files load unchanged — the field is `serde(default)`, so reading a v1
+/// document simply yields empty chains.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// File extension for OpenTrack projects.
 pub const EXTENSION: &str = "otp";

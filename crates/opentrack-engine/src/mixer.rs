@@ -1,6 +1,8 @@
 //! The offline audio mixer: turns a project timeline into a rendered stereo
-//! master (RFC-0004). This is real, working M0 code — the demo renders an
-//! actual crossfaded mix through it.
+//! master (RFC-0004). Tracks are mixed in fixed [`FX_BLOCK_FRAMES`] blocks
+//! so the M4 FX chains (per-track, automation-sampled at each block's start
+//! tick) process offline exactly like the realtime engine — bit-identical
+//! output, which the golden-file tests pin.
 
 use crate::codec::{AudioSource, CodecBackend, CodecError};
 use opentrack_core::bus::{clamp_gain_db, db_to_linear, equal_power_pan};
@@ -58,9 +60,12 @@ pub enum RenderError {
     /// No events to render.
     #[error("timeline is empty - nothing to render")]
     EmptyTimeline,
-    /// Video pipeline placeholder (M3).
-    #[error("video rendering lands in M3 (see RFC-0007): {0}")]
-    NotYetImplemented(&'static str),
+    /// Video pipeline failure (M3 renderer).
+    #[error("video render error: {0}")]
+    Video(#[from] crate::video::VideoError),
+    /// AVI mux failure.
+    #[error("avi: {0}")]
+    Avi(#[from] crate::avi::AviError),
     /// Decoder failure.
     #[error("codec error: {0}")]
     Codec(#[from] crate::codec::CodecError),
@@ -108,7 +113,18 @@ fn ticks_to_frames(t: Ticks, tps: i64, sample_rate: u32) -> usize {
     ((t.to_seconds_f64(tps)) * sample_rate as f64).round() as usize
 }
 
-/// Renders every audible audio track through event/track/master processing
+/// One event decoded + resampled to the render rate, ready to be spread
+/// across the mix blocks.
+struct PreparedEvent {
+    data: Vec<f32>,
+    start_frame: usize,
+    len_frames: usize,
+    fade_in: usize,
+    fade_out: usize,
+    gain: f32,
+}
+
+/// Renders every audible audio track through event/track FX/master processing
 /// into a stereo master.
 ///
 /// Crossfades: events overlapping on one track each carry their own fades,
@@ -154,20 +170,35 @@ pub fn render_audio(
         let (p_l, p_r) = equal_power_pan(props.pan);
 
         if audible {
+            // Decode + resample every event once (per track).
+            let mut prepared: Vec<PreparedEvent> = Vec::new();
             for event in &track.events {
-                mix_event(
-                    project,
-                    event,
-                    backends,
-                    tps,
-                    sr,
-                    total_frames,
-                    t_gain,
-                    p_l,
-                    p_r,
-                    &mut out,
-                    &mut issues,
-                );
+                if let Some(pe) = prepare_event(project, event, backends, tps, sr, &mut issues) {
+                    prepared.push(pe);
+                }
+            }
+            // Track FX chain (M4): processed in fixed blocks with automation
+            // sampled at each block's start tick — identical to realtime.
+            let mut runner = crate::afx::AudioChainRunner::build(&track.fx_chain, 2, sr);
+            let chain = track.fx_chain.clone();
+            let block_frames = crate::afx::FX_BLOCK_FRAMES;
+            let mut block_start = 0usize;
+            while block_start < total_frames {
+                let end = (block_start + block_frames).min(total_frames);
+                let n = end - block_start;
+                let mut block = vec![0f32; n * 2];
+                for ev in &prepared {
+                    spread_event(ev, block_start, &mut block, total_frames);
+                }
+                if !chain.is_empty() {
+                    let tick = (block_start as f64 / sr as f64 * tps as f64).round() as i64;
+                    runner.process(&chain, &mut block, tick);
+                }
+                for (j, s) in block.iter().enumerate() {
+                    let dst = block_start * 2 + j;
+                    out[dst] += s * t_gain * if j % 2 == 0 { p_l } else { p_r };
+                }
+                block_start = end;
             }
         }
         progress((ti + 1) as f32 / total_tracks as f32);
@@ -189,20 +220,38 @@ pub fn render_audio(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn mix_event(
+/// Copies one prepared event's contribution into a mix block (fades
+/// included). `block` covers frames `[block_start, block_start + n)` of the
+/// timeline at output rate, stereo-interleaved.
+fn spread_event(ev: &PreparedEvent, block_start: usize, block: &mut [f32], total_frames: usize) {
+    let n = block.len() / 2;
+    let ev_end = ev.start_frame + ev.len_frames;
+    let from = ev.start_frame.max(block_start);
+    let to = ev_end.min(block_start + n).min(total_frames);
+    if from >= to {
+        return;
+    }
+    for dst in from..to {
+        let i = dst - ev.start_frame;
+        if i >= ev.len_frames || i * 2 + 1 >= ev.data.len() {
+            break; // source ended early (short file / EOF)
+        }
+        let g = ev.gain * fade_gain(i, ev.len_frames, ev.fade_in, ev.fade_out);
+        let b = (dst - block_start) * 2;
+        block[b] += ev.data[i * 2] * g;
+        block[b + 1] += ev.data[i * 2 + 1] * g;
+    }
+}
+
+/// Decodes + resamples one event's source to the render rate.
+fn prepare_event(
     project: &Project,
     event: &opentrack_core::timeline::Event,
     backends: &[Arc<dyn CodecBackend>],
     tps: i64,
     sr: u32,
-    total_frames: usize,
-    t_gain: f32,
-    p_l: f32,
-    p_r: f32,
-    out: &mut [f32],
     issues: &mut Vec<MixIssue>,
-) {
+) -> Option<PreparedEvent> {
     let issue = |event: EventId, message: String, issues: &mut Vec<MixIssue>| {
         issues.push(MixIssue { event, message });
     };
@@ -213,7 +262,7 @@ fn mix_event(
             format!("missing media asset {}", event.media),
             issues,
         );
-        return;
+        return None;
     };
     let audio_ok = match &asset.kind {
         MediaKind::Audio { .. } => true,
@@ -226,7 +275,7 @@ fn mix_event(
             format!("'{}' carries no audio", asset.label),
             issues,
         );
-        return;
+        return None;
     }
 
     // Open a decoder (pure-rust backend handles WAV; bridge handles the rest).
@@ -234,7 +283,7 @@ fn mix_event(
         Ok(pair) => pair,
         Err(e) => {
             issue(event.id, format!("'{}': {e}", asset.label), issues);
-            return;
+            return None;
         }
     };
     let src_spec = src.spec();
@@ -247,7 +296,7 @@ fn mix_event(
             format!("'{}': seek failed: {e}", asset.label),
             issues,
         );
-        return;
+        return None;
     }
     let raw = match read_all(src.as_mut()) {
         Ok(d) => d,
@@ -257,7 +306,7 @@ fn mix_event(
                 format!("'{}': decode failed: {e}", asset.label),
                 issues,
             );
-            return;
+            return None;
         }
     };
     let src_ch = (src_spec.channels as usize).max(1);
@@ -266,30 +315,29 @@ fn mix_event(
     } else {
         raw
     };
-    let frames_avail = data.len() / src_ch;
-
-    let event_gain = db_to_linear(event.gain_db.clamp(-96.0, 24.0));
-    let start_frame = ticks_to_frames(event.start, tps, sr);
-    let len_frames = ticks_to_frames(event.length, tps, sr).max(1);
-    let fi = ticks_to_frames(event.fade_in, tps, sr);
-    let fo = ticks_to_frames(event.fade_out, tps, sr);
-
-    for i in 0..len_frames {
-        let dst = start_frame + i;
-        if dst >= total_frames {
-            break;
+    // Normalize everything to stereo (the M0 mix bus is stereo-only).
+    let data = match src_ch {
+        1 => data.iter().flat_map(|s| [*s, *s]).collect::<Vec<f32>>(),
+        2 => data,
+        _ => {
+            let frames = data.len() / src_ch;
+            let mut v = Vec::with_capacity(frames * 2);
+            for f in 0..frames {
+                v.push(data[f * src_ch]);
+                v.push(data[f * src_ch + 1]);
+            }
+            v
         }
-        if i >= frames_avail {
-            break; // source ended early (short file / EOF)
-        }
-        let g = event_gain * fade_gain(i, len_frames, fi, fo);
-        let (l, r) = match src_ch {
-            1 => (data[i], data[i]),
-            _ => (data[i * src_ch], data[i * src_ch + 1]),
-        };
-        out[dst * 2] += l * g * t_gain * p_l;
-        out[dst * 2 + 1] += r * g * t_gain * p_r;
-    }
+    };
+
+    Some(PreparedEvent {
+        data,
+        start_frame: ticks_to_frames(event.start, tps, sr),
+        len_frames: ticks_to_frames(event.length, tps, sr).max(1),
+        fade_in: ticks_to_frames(event.fade_in, tps, sr),
+        fade_out: ticks_to_frames(event.fade_out, tps, sr),
+        gain: db_to_linear(event.gain_db.clamp(-96.0, 24.0)),
+    })
 }
 
 #[cfg(test)]
@@ -318,6 +366,7 @@ mod tests {
             kind: TrackKind::Audio(Default::default()),
             events: vec![],
             locked: false,
+            fx_chain: Default::default(),
         });
         let t2_id = opentrack_core::TrackId::from_raw(p.alloc_id());
         p.tracks.push(opentrack_core::timeline::Track {
@@ -326,6 +375,7 @@ mod tests {
             kind: TrackKind::Audio(Default::default()),
             events: vec![],
             locked: false,
+            fx_chain: Default::default(),
         });
 
         let dur = Ticks::from_seconds(1.0, p.timebase.ticks_per_second);

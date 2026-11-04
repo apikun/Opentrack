@@ -11,7 +11,7 @@ internals.
 
 ---
 
-## M0 — Blueprint & skeleton ✅ (this release)
+## M0 — Blueprint & skeleton ✅ (0.1.0)
 
 Working data model, offline audio render, GUI shell, project files.
 
@@ -37,7 +37,7 @@ Working data model, offline audio render, GUI shell, project files.
 `opentrack demo` renders a crossfaded stereo master end-to-end with zero
 non-Rust dependencies.
 
-## M1 — Interactive timeline editing ✅ (core shipped; M1.1 extras deferred)
+## M1 — Interactive timeline editing ✅ (0.2.0)
 
 Make the GUI a real editor, not a viewer.
 
@@ -71,7 +71,7 @@ identical output (`opentrack render`). — demonstrated by the shipped op
 pipeline tests; video preview decode verified by fixture tests in
 `opentrack-engine::video` and the `opentrack frame` CLI round-trip.
 
-## M2 — Realtime audio playback ✅ (this release)
+## M2 — Realtime audio playback ✅ (0.3.0)
 
 - [x] Worker-thread mix graph rebuilt on `History` revision (decode-ahead per
       track: `AudioSource` chunks → stateful `StreamResampler` → stereo,
@@ -102,50 +102,84 @@ for local soak tests). Realtime-vs-offline parity is proven by test
 (WASAPI/CoreAudio) is exercised on hardware by the GUI; CI validates the
 deterministic mix-graph/transport path.
 
-## M3 — Video: decode, composite, render 🚧 (decode shipped in M1)
+## M3 — Video: decode, composite, render ✅ (0.4.0)
 
 - [x] Pure-Rust H.264 decode for preview (shipped early in M1):
       MP4/MOV demux (`craft-media` isobmff) + `filmcraft-h264` + our
       YUV 4:2:0 → RGBA conversion — see `ATTRIBUTION.md` for licenses
-- [ ] `VideoDecoder` trait consolidation across backends; MJPEG-AVI path
-- [ ] Frame cache keyed by `(MediaId, frame)` with byte budget + eviction
-- [ ] Compositor: track stacking order, per-track opacity, blend modes
-      (already modeled: `BlendMode`), event fades → alpha ramps
-- [ ] GPU presentation of the composited frame in the egui canvas
-- [ ] Timeline video preview resolution scaling (1/1, 1/2, 1/4)
-- [ ] Render pipeline: compositor → PNG/JPEG frames + WAV →
-      pure-Rust AVI/MJPEG muxer; optional rav1e AV1 export behind a feature
-- [ ] Audio/video sync discipline: single master clock, frame-accurate seeks
+- [x] `VideoDecoder` trait consolidation (RFC-0007: info/seek_frame/
+      next_frame → RGBA8); pure-Rust Motion-JPEG AVI decode (in-house RIFF
+      walker + zune-jpeg); ffmpeg bridge for everything else
+- [x] Frame cache keyed by `(MediaId, frame)` with 256 MiB budget + LRU
+      eviction (`opentrack-engine::frame_cache`)
+- [x] Compositor: track stacking order (index 0 = top), per-track opacity,
+      blend modes (Normal/Add/Multiply/Screen), event fades → alpha ramps
+- [x] Composited frame presentation in the egui canvas (CPU composite →
+      texture upload; the shader path is an explicit post-M4 optimization
+      RFC, per RFC-0007 non-goals)
+- [x] Preview resolution scaling (1/1, 1/2, 1/4) with a GUI toggle
+- [x] Render pipeline: compositor → JPEG frames → pure-Rust AVI/MJPEG
+      muxer (+ WAV master from the same tick clock, + optional PNG stills);
+      optional rav1e AV1 export behind `--features export-av1`
+- [x] A/V sync discipline: single master tick clock (audio samples and
+      video frames both derive from it); frame-accurate seeks via keyframe
+      runs (MP4) and exact frame tables (AVI)
 
-**Acceptance:** M1-built session containing PNG stills + MJPEG clips + WAV
-audio renders to a playable AVI whose frame count × fps matches the timeline
-duration exactly.
+**Acceptance (demonstrated in tests):** a session with PNG stills + MJPEG
+clips + WAV audio renders to a playable AVI whose frame count × fps matches
+the timeline duration exactly — `render::tests::
+video_render_frame_count_acceptance` (6.0 s @ 30 fps → exactly 180 frames,
+companion WAV sample count matches the M0 mixer output, AVI demuxes back
+with 180 frames, 180 PNG stills exported).
 
-## M4 — FX framework ⬜
+## M4 — FX framework ✅ (0.4.0)
 
-- [ ] Parameter model shipped in M0 (`FxDescriptor`, `ParamSpec`, `Domain`)
-      extended with automation lanes per parameter
-- [ ] Audio FX: Track EQ (3-band), compressor, limiter, reverb send — DSP
-      module-by-module with offline + realtime parity tests
-- [ ] Video FX: brightness/contrast, saturation, 1D LUTs; GPU path via
-      egui-paintable shaders, CPU reference implementation for tests
-- [ ] FX chain UI: per-track rack, drag reorder, bypass, presets
-- [ ] Render parity: realtime FX bit-match offline FX at 32-bit float stage
+- [x] Parameter model (`FxDescriptor`, `ParamSpec`, `Domain`) extended with
+      automation lanes per parameter (`AutomationLane`, linear/constant
+      curves, sampled at block ticks; `.otp` v2, v1 files load as-is)
+- [x] Audio FX (offline mixer runs tracks through `AudioChainRunner` in
+      fixed 128-frame blocks — the same runner the realtime engine feeds):
+      3-band shelving/peaking EQ (RBJ biquads), feed-forward compressor,
+      brickwall limiter, Schroeder reverb send
+- [x] Video FX, CPU reference implementation: brightness/contrast,
+      saturation, 1D LUTs (3 baked curves) applied per video track in the
+      compositor; the GPU/shader path remains a post-M4 optimization RFC
+      (RFC-0007 non-goal — CPU first, parity tests exist)
+- [x] FX chain UI: per-track rack in the right panel — add from the
+      registry (domain-filtered), reorder (↑/↓), bypass toggle, remove,
+      parameter sliders from `ParamSpec`, factory presets, automation
+      points add/remove at the playhead
+- [x] Render parity: realtime and offline DSP share the exact processor
+      types at the f32 stage; golden test proves the same stream processed
+      in one call vs many `FX_BLOCK_FRAMES` blocks is bit-identical
+      (`afx::tests::block_chunking_is_bit_identical_parity`)
 
-**Acceptance:** golden-file tests prove realtime and offline DSP produce
-identical buffers; every stock FX has docs and a preset bank.
+**Acceptance (demonstrated in tests):** the chunking-parity golden file
+proves identical f32 buffers across call patterns; every stock FX has a
+descriptor, docs and a preset bank (`opentrack_core::fx::presets`).
 
-## M5 — Ecosystem & packaging ⬜
+## M5 — Ecosystem & packaging ✅ (0.4.0)
 
-- [ ] Plugin ABI v0 (audio: process f32 blocks; video: filter RGBA8 frames)
-      — design via RFC process, frozen before any third-party promise
-- [ ] Scripting surface (project-level Lua/Rhai) for batch ops
-- [ ] Installer/MSIX for Windows, AppImage for Linux, signed notarized dmg
-- [ ] Per-platform VST/iPlug-style hosting evaluation (research RFC only)
-- [ ] Documentation site; tutorial video series; parity matrix 100% reviewed
+- [x] Plugin ABI v0 designed via RFC-0009 (audio: in-place f32 blocks;
+      video: in-place RGBA8 frames) with the in-process reference host +
+      two builtin example plugins shipped; dynamic loading stays behind
+      its own RFC before any third-party promise
+- [x] Scripting surface (Rhai, RFC-0010): `opentrack script FILE.rhai
+      PROJECT.otp` for batch ops over the media pool/tracks/events/FX
+- [x] Installers: `cargo xtask installer` — Windows zip (+ WiX `.wxs` and
+      MSIX `make-msix.ps1` scaffolding), Linux `.AppDir`/AppImage with
+      `.desktop` entry, macOS `.app` + `hdiutil` dmg (signing/notarization
+      documented in `packaging/macos/README.md` — identity-bound steps are
+      out of CI's reach by design)
+- [x] VST/iPlug-style hosting evaluation as research RFC-0011 only
+      (recommendation: CLAP first, never VST2)
+- [x] Documentation site (`cargo xtask site` → static `docs/site/`),
+      tutorial series (`docs/tutorials/`), parity matrix reviewed
+      (`docs/vegas-parity.md`)
 
-**Acceptance:** a fresh contributor can build an installer for their platform
-from a clean clone with one command.
+**Acceptance (demonstrated):** a fresh contributor builds an installer for
+their platform from a clean clone with one command — `cargo xtask
+installer` (verified on Linux: release build + `OpenTrack.AppDir`).
 
 ---
 
