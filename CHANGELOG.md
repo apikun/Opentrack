@@ -3,6 +3,49 @@
 All notable changes to OpenTrack are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com); versions are tagged `vX.Y.Z`.
 
+## [0.3.0] — M2: realtime audio playback
+
+### Added
+
+- **Realtime audio engine** (`opentrack-engine::realtime`, RFC-0008): the
+  timeline plays through the platform output device with the same mix math as
+  the offline renderer.
+  - worker thread decodes ahead per audio track (backend-chain decoders →
+    stateful streaming resampler → stereo, event gain + fades pre-applied) and
+    hands 20 ms blocks to the output callback through a hand-rolled lock-free
+    bounded SPSC queue (3 blocks ≈ 60 ms);
+  - the audio callback never locks, allocates or decodes; seek/rebuild swap
+    generation-tagged queues so scrubbing never mixes stale audio;
+  - **live parameters**: track gain/pan/mute/solo and the master bus apply
+    immediately from the GUI (fixed-point atomics + per-sample smoothing — no
+    zipper noise, no locks);
+  - **transport**: play/pause/stop, loop region, auto-stop at the timeline
+    end, play-at-end restarts from the top; the playhead is the audio clock
+    minus documented output latency, so picture and sound stay aligned;
+  - **peak meters** on every audio track strip and the master bus (atomic
+    publish, GUI poll with ballistics, green/yellow/red zones);
+  - realtime vs **offline parity** is tested (same crossfade session, max
+    sample diff < 1e-4).
+- **Device layer**: `cpal` (WASAPI / CoreAudio / ALSA) behind the optional
+  engine feature `out-cpal`; the GUI enables it by default via its `audio`
+  feature, headless builds (`--no-default-features`) compile the full engine
+  and degrade to a silent playhead with a status-bar reason.
+- **`opentrack smoke [--minutes N] [--realtime]`**: the M2 acceptance profile —
+  an 8-track, 48 kHz, N-minute session played through the *real* mix graph and
+  callback code (device simulated) with zero underruns; `--realtime` paces to
+  wall clock for local soak testing.
+- **GUI**: transport bar (Play/Pause/Stop/Loop + region display), loop region
+  via shift+drag on the ruler (right-click clears), track meters, master
+  meter, audio status/latency readout; `History` gained a `revision()` counter
+  the GUI diffs to rebuild the engine graph.
+- **Docs**: RFC-0008 (realtime engine), ARCHITECTURE §3.4 + invariants I8–I10,
+  ROADMAP M2 acceptance notes.
+
+### Platform notes
+
+- Linux CI/builds need `libasound2-dev` + `pkg-config` (added to CI). Windows
+  and macOS need nothing new.
+
 ## [0.2.0] — M1: interactive editing + video preview
 
 ### Added

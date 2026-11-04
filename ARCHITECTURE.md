@@ -48,14 +48,19 @@ opentrack (cargo workspace)
 │     codec.rs         CodecBackend + AudioSource traits, backend chain
 │     wav.rs           Pure-Rust WAV demux/decode + PCM s16 encode
 │     backend_ffmpeg.rs Optional ffmpeg/ffprobe bridge (runtime probed)
-│     dsp.rs           Sine synthesis, linear resampler, peak metering
+│     dsp.rs           Sine synthesis, resamplers (offline + streaming), peaks
 │     mixer.rs         Offline audio mixdown: fades → track bus → master
+│     realtime.rs      Realtime engine: SPSC queues, lock-free params, worker,
+│     │                transport, RenderState (shared by callback/tests/smoke)
+│     smoke.rs         CI smoke profile: 8-track N-minute realtime run
 │     render.rs        RenderJob orchestration (audio now, video in M3)
 │
-├── opentrack-cli      The `opentrack` binary: demo / new / probe / render / gui
+├── opentrack-cli      The `opentrack` binary: demo / new / probe / render /
+│                      smoke / frame / gui
 │
 └── opentrack-app      The egui (eframe) GUI shell: timeline view, media pool,
-                      project open/save, playhead animation
+                        transport + loop, peak meters, project open/save,
+                        video preview pane (engine.rs = audio handle)
 ```
 
 Dependency direction (enforced by review, one-way only):
@@ -117,6 +122,24 @@ bridge if the executables are found on `PATH`) and returns the first backend
 that can `probe` the file. This keeps zero-dependency builds real while letting
 users with ffmpeg installed open anything.
 
+### 3.4 Realtime audio playback (M2)
+
+```
+GUI ──EditOp──▶ Session ──▶ History.revision() bump ──▶ worker rebuilds graph
+GUI ──atomics─▶ strip/master params (dB×100, pan×1000, flags)
+worker: decode-ahead per track → StreamResampler → event gain+fades
+        → Spsc<Arc<MixBlock>> (3 × 20 ms)
+audio callback = RenderState::render():
+        pop block → strip gain/pan per-sample smoothing → master →
+        loop wrap / end stop → peaks (atomic fetch_max) → position
+```
+
+Details, invariants (callback never locks/allocates/decodes; single producer,
+single consumer; position written only by callback while playing) and the
+latency-compensation table live in [`docs/rfc/0008-realtime-audio.md`](docs/rfc/0008-realtime-audio.md).
+The same `RenderState::render` runs in the device callback, the tests and
+`opentrack smoke`, so the tested path is the shipped path.
+
 ## 4. Key invariants
 
 | # | Invariant | Enforced by |
@@ -128,24 +151,31 @@ users with ffmpeg installed open anything.
 | I5 | `.otp` files from newer format versions are refused, never guessed | `save::load` version gate |
 | I6 | Pure-Rust build (no ffmpeg present) compiles, tests and renders | CI runs without ffmpeg installed |
 | I7 | GUI never mutates `Project` outside `Session::exec` | code review + crate boundaries |
+| I8 | The audio callback never locks (except one queue swap per generation change), allocates, or decodes | `realtime.rs` design + review; `RenderState::render` has no locks/allocs on the steady path |
+| I9 | Realtime and offline mixes use identical gain/fade/pan math | shared `fade_gain`, `core::bus` math, parity test in `realtime.rs` |
+| I10 | cpal stays an optional feature; headless builds compile the full engine | `out-cpal` feature gate, CI covers both configurations |
 
-## 5. Threading & realtime (looking ahead)
+## 5. Threading & realtime
 
-M0 is synchronous by design. The intended shape for M2+:
+M0/M1 are synchronous except where noted; M2 introduced the realtime audio
+engine (RFC-0008):
 
-- **Engine thread** owns the `Project` render snapshot; the GUI thread posts
-  `EditOp`s and receives state revisions (never shared mutable state).
-- **Audio callback** (cpal) pulls from a lock-free prebuilt mix graph; the GUI
-  metering path reads atomically published peaks.
-- **Video playback** (M3) decodes ahead into a small ring of GPU-uploaded
+- **Worker thread** (`opentrack-audio-worker`) owns the decoded mix graph and
+  produces 20 ms blocks; it is the only decoder user and the queue's only
+  producer.
+- **Audio callback** (cpal, feature `out-cpal`) is the only queue consumer and
+  the only writer of `position` during playback; it never locks, allocates or
+  decodes.
+- **GUI thread** writes parameters as atomics, reads position/peaks, and
+  triggers graph rebuilds by diffing `History::revision()`.
+- **Video playback** (M3) will decode ahead into a small ring of GPU-uploaded
   textures keyed by `(MediaId, frame)`.
 
 None of this changes the model: `EditOp` remains the only mutation channel.
 
 ## 6. Versioning
 
-- Workspace version is `0.x` until M2; breaking model changes bump the minor.
+- Workspace version is `0.x` until M5; breaking model changes bump the minor.
 - `.otp` format version is independent (`FORMAT_VERSION` in `save.rs`) and only
   ever increments.
-- Releases are tagged `vX.Y.Z` per [Keep a Changelog](https://keepachangelog.com)
-  once a CHANGELOG exists (M1).
+- Releases are tagged `vX.Y.Z` per [Keep a Changelog](https://keepachangelog.com).

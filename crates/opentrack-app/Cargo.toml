@@ -12,3 +12,9 @@ repository.workspace = true
 opentrack-core = { workspace = true }
 opentrack-engine = { workspace = true }
 eframe = { workspace = true }
+
+[features]
+default = ["audio"]
+# Realtime audio output via cpal (WASAPI/CoreAudio/ALSA). Turn off for
+# headless builds (`cargo build -p opentrack-app --no-default-features`).
+audio = ["opentrack-engine/out-cpal"]

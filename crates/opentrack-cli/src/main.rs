@@ -9,6 +9,8 @@
 //! opentrack frame FILE [--at SECS] [-o OUT.bmp]
 //!                               decode one video frame (pure-Rust H.264)
 //! opentrack render PROJECT [-o OUT.wav] [--rate HZ]
+//! opentrack smoke [--minutes N] [--realtime]
+//!                               realtime-engine dropout smoke profile
 //! opentrack gui                 print how to launch the egui shell
 //! ```
 
@@ -37,6 +39,9 @@ COMMANDS:
                                    decode one video frame to a BMP (pure-Rust H.264)
     render PROJECT [-o OUT] [--rate HZ]
                                    offline audio render of a .otp project
+    smoke [--minutes N] [--realtime]
+                                   play an 8-track session through the realtime
+                                   engine (M2 acceptance: zero underruns)
     gui                            how to launch the egui shell
     version                        print version
     help                           print this help
@@ -81,6 +86,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "probe" => cmd_probe(rest),
         "frame" => cmd_frame(rest),
         "render" => cmd_render(rest),
+        "smoke" => cmd_smoke(rest),
         "gui" => {
             println!("The egui shell is the `opentrack-app` crate. Launch it with:");
             println!("  cargo run -p opentrack-app");
@@ -230,6 +236,55 @@ fn cmd_frame(rest: &[String]) -> Result<ExitCode, String> {
         frame.key
     );
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_smoke(rest: &[String]) -> Result<ExitCode, String> {
+    let mut minutes = 10u32;
+    let mut realtime = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--minutes" | "-m" => {
+                minutes = rest
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--minutes expects a number")?;
+                i += 2;
+            }
+            "--realtime" => {
+                realtime = true;
+                i += 1;
+            }
+            other => {
+                return Err(format!("unknown smoke option `{other}`"));
+            }
+        }
+    }
+    let report = opentrack_engine::run_smoke(minutes, realtime)?;
+    println!(
+        "opentrack smoke: {} tracks x {:.0} min @ 48 kHz ({})",
+        report.tracks,
+        report.minutes,
+        if report.realtime {
+            "real-time paced"
+        } else {
+            "as fast as the producer feeds"
+        }
+    );
+    println!(
+        "  played {:.2}s ({} frames) in {:.1}s wall, underruns {}, decode issues {}",
+        report.frames as f64 / 48_000.0,
+        report.frames,
+        report.wall_secs,
+        report.underruns,
+        report.issues
+    );
+    if report.underruns == 0 && report.issues == 0 {
+        println!("  PASS: transport played the full span with zero dropouts");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err("smoke FAILED: dropouts or decode issues detected".into())
+    }
 }
 
 fn cmd_render(rest: &[String]) -> Result<ExitCode, String> {

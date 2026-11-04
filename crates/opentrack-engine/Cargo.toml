@@ -13,6 +13,11 @@ opentrack-core = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+# Optional realtime output device (WASAPI / CoreAudio / ALSA). Kept optional
+# so headless builds (CI containers without ALSA headers) still compile the
+# full engine; the GUI enables it via its `audio` feature.
+cpal = { version = "0.15", optional = true, default-features = false }
+
 # Pure-Rust MP4/H.264 decode (M1 video preview). Both are MIT OR Apache-2.0;
 # see ATTRIBUTION.md. craft-media rev is the same pin the upstream h264 crate
 # is tested against; filmcraft-h264 is pinned to a reviewed upstream commit.
@@ -20,3 +25,6 @@ craft-media = { version = "0.1.0", default-features = false, features = [
     "isobmff",
 ], git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7" }
 filmcraft-h264 = { git = "https://github.com/storytold/filmcraft", rev = "c9be14245a6c9da585ff906a6e0ca9c8200652ea" }
+
+[features]
+out-cpal = ["dep:cpal"]

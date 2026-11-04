@@ -10,7 +10,7 @@ assets, no protocol/SDK reimplementation — only publicly observable behavior,
 documented in RFCs, written by and for the open-source community.
 
 - License: **GPL-3.0-or-later** (see [`LICENSE`](LICENSE))
-- Status: **M1 — interactive editing + video preview** (working data model + offline audio render + editable timeline + pure-Rust H.264 preview)
+- Status: **M2 — realtime audio playback** (data model + offline render + interactive editing + pure-Rust H.264 preview + realtime playback with meters and loop transport)
 - Platform: **Windows first**, then Linux/macOS (CI matrix in [`.github/workflows/ci.yml`](.github/workflows/ci.yml))
 
 > **Disclaimer** — OpenTrack is not affiliated with, endorsed by, or derived from
@@ -52,6 +52,7 @@ opentrack demo - building a Vegas-style session in opentrack-demo
 | `opentrack probe FILE` | Identify media through the backend chain (pure-Rust first, then ffmpeg) |
 | `opentrack frame FILE [--at SECS] [-o OUT.bmp]` | Decode one video frame to a BMP (pure-Rust H.264, no ffmpeg) |
 | `opentrack render PROJECT [-o OUT] [--rate HZ]` | Offline audio render of a project |
+| `opentrack smoke [--minutes N] [--realtime]` | Play an 8-track session through the realtime engine — the M2 acceptance profile (zero underruns) |
 | `opentrack gui` | Print how to launch the egui shell |
 
 Load the demo into the GUI: `cargo run -p opentrack-app -- --project opentrack-demo/demo.otp`
@@ -70,11 +71,13 @@ Release builds (CLI + GUI, Windows first) are attached to every
 crates/
   opentrack-core     Project/timeline data model, editing ops + undo, buses, .otp I/O
   opentrack-engine   CodecBackend trait, pure-Rust WAV codec, ffmpeg bridge,
-                     pure-Rust MP4/H.264 video decode, offline mixer
-  opentrack-cli      The `opentrack` binary (demo / new / probe / frame / render)
-  opentrack-app      The egui GUI: interactive timeline, video preview, media pool
+                     pure-Rust MP4/H.264 video decode, offline mixer,
+                     realtime playback engine (RFC-0008)
+  opentrack-cli      The `opentrack` binary (demo / new / probe / frame / render / smoke)
+  opentrack-app      The egui GUI: interactive timeline, video preview, media pool,
+                     transport + loop + peak meters
 docs/
-  rfc/               RFC 0001-0007: the blueprint proper
+  rfc/               RFC 0001-0008: the blueprint proper
   vegas-parity.md    Feature-by-feature parity matrix vs. the Vegas workflow
 ARCHITECTURE.md      How the crates fit together
 ROADMAP.md           M0..M5 milestones with acceptance criteria
@@ -83,7 +86,7 @@ ATTRIBUTION.md       Upstream components and licenses (filmcraft-h264, craft-med
 CHANGELOG.md         Release notes per version
 ```
 
-### What already works (M0 + M1)
+### What already works (M0 + M1 + M2)
 
 - **Timeline model**: tracks (video top-down / audio), events with takes, fades,
   media in-points; Vegas-style **split / trim / slip / move / ripple delete** as
@@ -95,6 +98,12 @@ CHANGELOG.md         Release notes per version
 - **Video preview (M1)**: the pane under the playhead decodes **H.264/MP4
   in pure Rust** — MP4/MOV demux + AVC decode + YUV→RGBA — no ffmpeg needed.
   Frame-accurate scrubbing; streaming GOP decode keeps playback O(1) per frame.
+- **Realtime audio playback (M2)**: Space plays the mix through the platform
+  device (WASAPI/CoreAudio/ALSA) with the same gain/fade/pan math as the
+  offline render; track strips and the master fader update live (lock-free
+  smoothing), peak meters run on every strip and the master, and a loop region
+  (shift+drag the ruler) cycles playback. The audio callback never locks,
+  allocates or decodes (RFC-0008).
 - **Snapping**: grid + event-edge snapping with configurable threshold.
 - **Audio bus math**: equal-power pan law, dBFS gain, mute/solo semantics,
   master bus (`opentrack-core::bus`).
@@ -107,8 +116,8 @@ CHANGELOG.md         Release notes per version
 
 ### What is deliberately not built yet
 
-Video compositing/multi-clip render and video export (M3), realtime audio
-playback (M2), FX DSP (M4/M5), multi-select/cross-track moves (M1.1). Every
+Video compositing/multi-clip render and video export (M3), FX DSP (M4/M5),
+multi-select/cross-track moves (M1.1). Every
 gap has an RFC and a milestone:
 see [`ROADMAP.md`](ROADMAP.md) and [`docs/vegas-parity.md`](docs/vegas-parity.md).
 
@@ -120,9 +129,12 @@ see [`ROADMAP.md`](ROADMAP.md) and [`docs/vegas-parity.md`](docs/vegas-parity.md
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+opentrack smoke --minutes 10   # realtime engine acceptance profile
 ```
 
-CI enforces all three on Windows first, then Ubuntu and macOS.
+CI enforces all three on Windows first, then Ubuntu and macOS (Linux CI/heads
+need `libasound2-dev` + `pkg-config` for the realtime output). Headless builds
+without audio hardware: `cargo build -p opentrack-app --no-default-features`.
 MSRV: **1.95** (edition 2024). Third-party components and their licenses:
 [`ATTRIBUTION.md`](ATTRIBUTION.md).
 

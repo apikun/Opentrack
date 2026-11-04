@@ -15,6 +15,7 @@ something is the way it is, start here.
 | [0005](0005-gui-egui-shell.md) | GUI shell (egui) layout & interaction plan | Accepted (M0; M1 interactions amended) |
 | [0006](0006-project-file-format.md) | `.otp` project file format | Accepted (M0) |
 | [0007](0007-video-render-pipeline.md) | Video compositing & render pipeline | Draft — decode half shipped early (M1/0.2.0) |
+| [0008](0008-realtime-audio.md) | Realtime audio playback engine | Implemented (M2/0.3.0) |
 
 ## Lifecycle
 

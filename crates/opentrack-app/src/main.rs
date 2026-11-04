@@ -17,6 +17,8 @@ use opentrack_core::timeline::AudioTrackProps;
 use opentrack_core::undo::EditOp;
 use opentrack_core::{EventId, MediaId, MediaKind, Project, Ticks, TrackId, TrackKind};
 use opentrack_engine::VideoDecoder;
+mod engine;
+use engine::AudioEngine;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -35,7 +37,7 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
     eframe::run_native(
-        "OpenTrack - clean-room Rust NLE (M1)",
+        "OpenTrack - clean-room Rust NLE (M2)",
         options,
         Box::new(move |_cc| Ok(Box::new(OpenTrackApp::new(project_arg)))),
     )
@@ -134,6 +136,10 @@ enum TlEvent {
     ToggleSolo(TrackId),
     CommitGain(TrackId, f32),
     CommitPan(TrackId, f32),
+    // ---- M2 loop region -------------------------------------------------
+    LoopDragStart(f64),
+    LoopDragUpdate(f64),
+    ClearLoop,
 }
 
 struct OpenTrackApp {
@@ -153,6 +159,15 @@ struct OpenTrackApp {
     pool_selection: Option<MediaId>,
     gain_drag: HashMap<TrackId, f32>,
     pan_drag: HashMap<TrackId, f32>,
+    // ---- M2 realtime audio -------------------------------------------
+    audio: AudioEngine,
+    last_revision: u64,
+    /// Per-slot meter values with ballistics (attack instant, release ~0.88).
+    meters: Vec<f32>,
+    master_meter: (f32, f32),
+    loop_on: bool,
+    loop_region: Option<(f64, f64)>,
+    loop_drag: Option<f64>,
 }
 
 impl OpenTrackApp {
@@ -161,6 +176,7 @@ impl OpenTrackApp {
             .as_deref()
             .and_then(|p| save::load(p).ok())
             .unwrap_or_else(|| Project::new("Untitled"));
+        let audio = AudioEngine::spawn(&project, opentrack_engine::default_backends());
         Self {
             session: Session::new(project),
             project_path,
@@ -178,6 +194,13 @@ impl OpenTrackApp {
             pool_selection: None,
             gain_drag: HashMap::new(),
             pan_drag: HashMap::new(),
+            audio,
+            last_revision: 0,
+            meters: Vec::new(),
+            master_meter: (0.0, 0.0),
+            loop_on: false,
+            loop_region: None,
+            loop_drag: None,
         }
     }
 
@@ -223,6 +246,66 @@ impl OpenTrackApp {
         if let Err(e) = self.session.exec(op) {
             self.toast(ctx, format!("{label}: {e}"));
         }
+    }
+
+    // ---- M2 transport / realtime helpers --------------------------------
+
+    /// Pushes a track's current strip state into the engine (live atomics).
+    fn sync_track_live(&mut self, track: TrackId) {
+        let props = self.project().track(track).and_then(|t| match &t.kind {
+            TrackKind::Audio(p) => Some(p.clone()),
+            _ => None,
+        });
+        if let Some(props) = props {
+            let any_solo = self.project().any_solo();
+            self.audio.set_track_props(track, &props);
+            self.audio.set_any_solo(any_solo);
+        }
+    }
+
+    /// Re-applies the loop region to the engine from UI state.
+    fn apply_loop(&mut self) {
+        let region = if self.loop_on {
+            Some(
+                self.loop_region
+                    .unwrap_or((0.0, self.duration_secs().max(1.0))),
+            )
+        } else {
+            None
+        };
+        self.audio.set_loop_secs(region);
+    }
+
+    fn transport_toggle(&mut self) {
+        if !self.audio.available() {
+            self.playing = !self.playing;
+            return;
+        }
+        // Play at the end restarts from the top (Vegas behavior).
+        if !self.audio.is_playing() && self.audio.position_secs() >= self.duration_secs() {
+            self.audio.seek_secs(0.0);
+        }
+        self.audio.toggle_play();
+    }
+
+    fn transport_stop(&mut self) {
+        self.audio.stop();
+        self.playing = false;
+        self.playhead = 0.0;
+    }
+
+    /// Polls engine peak meters into GUI-side ballistics state.
+    fn poll_meters(&mut self) {
+        let slots = self.audio.track_slots();
+        self.meters.resize(slots, 0.0);
+        for slot in 0..slots {
+            let p = self.audio.swap_track_peak(slot);
+            let decayed = (self.meters[slot] * 0.88).max(p);
+            self.meters[slot] = decayed;
+        }
+        let (ml, mr) = self.audio.swap_master_peak();
+        self.master_meter.0 = (self.master_meter.0 * 0.88).max(ml);
+        self.master_meter.1 = (self.master_meter.1 * 0.88).max(mr);
     }
 
     /// Declared source duration of a media asset, in project ticks.
@@ -468,7 +551,7 @@ impl OpenTrackApp {
             }
         }
         if space {
-            self.playing = !self.playing;
+            self.transport_toggle();
         }
         if s {
             self.split_selected(ctx);
@@ -479,15 +562,19 @@ impl OpenTrackApp {
         let frame = self.frame_ticks().to_seconds_f64(self.tps());
         if home {
             self.playhead = 0.0;
+            self.audio.seek_secs(0.0);
         }
         if end {
             self.playhead = self.duration_secs();
+            self.audio.seek_secs(self.playhead);
         }
         if left {
             self.playhead = (self.playhead - frame).max(0.0);
+            self.audio.seek_secs(self.playhead);
         }
         if right {
             self.playhead += frame;
+            self.audio.seek_secs(self.playhead);
         }
         if zin {
             self.zoom = (self.zoom * 1.25).min(400.0);
@@ -754,18 +841,39 @@ impl OpenTrackApp {
             }
             TlEvent::Scrub(secs) => {
                 self.playhead = secs.max(0.0);
+                self.audio.seek_secs(self.playhead);
             }
             TlEvent::ToggleMute(track) => {
                 self.mutate_audio_props(ctx, track, |p| p.mute = !p.mute);
+                self.sync_track_live(track);
             }
             TlEvent::ToggleSolo(track) => {
                 self.mutate_audio_props(ctx, track, |p| p.solo = !p.solo);
+                self.sync_track_live(track);
             }
             TlEvent::CommitGain(track, gain) => {
                 self.mutate_audio_props(ctx, track, |p| p.gain_db = gain);
+                self.sync_track_live(track);
             }
             TlEvent::CommitPan(track, pan) => {
                 self.mutate_audio_props(ctx, track, |p| p.pan = pan);
+                self.sync_track_live(track);
+            }
+            TlEvent::LoopDragStart(secs) => {
+                self.loop_drag = Some(secs);
+                self.loop_region = Some((secs, secs));
+                self.apply_loop();
+            }
+            TlEvent::LoopDragUpdate(secs) => {
+                if let Some(a) = self.loop_drag {
+                    self.loop_region = Some((a.min(secs), a.max(secs)));
+                    self.apply_loop();
+                }
+            }
+            TlEvent::ClearLoop => {
+                self.loop_drag = None;
+                self.loop_region = None;
+                self.apply_loop();
             }
         }
     }
@@ -800,18 +908,37 @@ impl eframe::App for OpenTrackApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Playhead animation (audio output is M2; the preview advances).
         let now = ctx.input(|i| i.time);
-        if self.playing {
-            if let Some(prev) = self.last_frame_time {
-                self.playhead += now - prev;
+        if self.audio.available() {
+            // Realtime transport: the audio engine owns the playhead. The
+            // displayed time is the feed position minus output latency —
+            // what the listener hears *right now* (also what the video
+            // preview should show).
+            self.playing = self.audio.is_playing();
+            self.playhead = self.audio.position_display_secs();
+            if self.playing {
+                ctx.request_repaint();
             }
-            let end = self.duration_secs();
-            if self.playhead >= end {
-                self.playhead = 0.0;
-                self.playing = false;
+            // Rebuild the mix graph whenever the project revision changed.
+            let rev = self.session.history.revision();
+            if rev != self.last_revision {
+                self.last_revision = rev;
+                self.audio.set_project(&self.session.project);
             }
-            ctx.request_repaint();
+            self.poll_meters();
+        } else {
+            // Fallback (no device / headless build): silent wall-clock playhead.
+            if self.playing {
+                if let Some(prev) = self.last_frame_time {
+                    self.playhead += now - prev;
+                }
+                let end = self.duration_secs();
+                if self.playhead >= end {
+                    self.playhead = 0.0;
+                    self.playing = false;
+                }
+                ctx.request_repaint();
+            }
         }
         self.last_frame_time = Some(now);
 
@@ -838,6 +965,8 @@ impl OpenTrackApp {
                         self.project_path = None;
                         self.selected = None;
                         self.preview = None;
+                        self.transport_stop();
+                        self.audio.set_project(&self.session.project);
                         ui.close();
                     }
                     if ui.button("Open .otp...").clicked() {
@@ -1073,6 +1202,10 @@ impl OpenTrackApp {
                                                         );
                                                         if gr.changed() {
                                                             self.gain_drag.insert(track.id, gain);
+                                                            // Live (lock-free) while dragging.
+                                                            self.audio.set_track_gain_live(
+                                                                track.id, gain,
+                                                            );
                                                         }
                                                         if gr.drag_stopped() {
                                                             self.gain_drag.remove(&track.id);
@@ -1092,6 +1225,8 @@ impl OpenTrackApp {
                                                         );
                                                         if pr.changed() {
                                                             self.pan_drag.insert(track.id, pan);
+                                                            self.audio
+                                                                .set_track_pan_live(track.id, pan);
                                                         }
                                                         if pr.drag_stopped() {
                                                             self.pan_drag.remove(&track.id);
@@ -1134,6 +1269,22 @@ impl OpenTrackApp {
                                                             props.gain_db, props.pan
                                                         ));
                                                     });
+                                                    // Peak meter for this track's slot.
+                                                    let slot = self
+                                                        .audio
+                                                        .slot_of(track.id)
+                                                        .unwrap_or(usize::MAX);
+                                                    let v = self
+                                                        .meters
+                                                        .get(slot)
+                                                        .copied()
+                                                        .unwrap_or(0.0);
+                                                    meter_bar(
+                                                        ui,
+                                                        egui::vec2(HEADER_W - 24.0, 5.0),
+                                                        v,
+                                                        None,
+                                                    );
                                                 }
                                                 TrackKind::Video(_) => {
                                                     ui.small("video");
@@ -1193,15 +1344,45 @@ impl OpenTrackApp {
                                         );
                                         t += step;
                                     }
+                                    // Loop region highlight (M2).
+                                    if let Some((a, b)) = self.loop_region {
+                                        let x0 = o.x + a as f32 * self.zoom;
+                                        let x1 = o.x + b as f32 * self.zoom;
+                                        painter.rect_filled(
+                                            egui::Rect::from_min_size(
+                                                egui::pos2(x0, o.y),
+                                                egui::vec2((x1 - x0).max(2.0), RULER_H),
+                                            ),
+                                            0.0,
+                                            egui::Color32::from_rgba_unmultiplied(90, 160, 220, 80),
+                                        );
+                                    }
                                     let ruler_resp = ui.allocate_rect(
                                         egui::Rect::from_min_size(o, egui::vec2(lanes_w, RULER_H)),
                                         egui::Sense::click_and_drag(),
                                     );
-                                    if (ruler_resp.dragged() || ruler_resp.clicked())
+                                    let shift = ui.input(|i| i.modifiers.shift);
+                                    if ruler_resp.drag_started()
+                                        && shift
+                                        && let Some(p) = ruler_resp.interact_pointer_pos()
+                                    {
+                                        let secs = ((p.x - o.x) / self.zoom).max(0.0) as f64;
+                                        tl.push(TlEvent::LoopDragStart(secs));
+                                    } else if ruler_resp.dragged()
+                                        && shift
+                                        && self.loop_drag.is_some()
+                                        && let Some(p) = ruler_resp.interact_pointer_pos()
+                                    {
+                                        let secs = ((p.x - o.x) / self.zoom).max(0.0) as f64;
+                                        tl.push(TlEvent::LoopDragUpdate(secs));
+                                    } else if (ruler_resp.dragged() || ruler_resp.clicked())
                                         && let Some(p) = ruler_resp.interact_pointer_pos()
                                     {
                                         let secs = ((p.x - o.x) / self.zoom).max(0.0) as f64;
                                         tl.push(TlEvent::Scrub(secs));
+                                    }
+                                    if ruler_resp.secondary_clicked() {
+                                        tl.push(TlEvent::ClearLoop);
                                     }
 
                                     // Tracks + events
@@ -1444,7 +1625,23 @@ impl OpenTrackApp {
             ui.horizontal(|ui| {
                 let play_label = if self.playing { "Pause" } else { "Play" };
                 if ui.button(play_label).clicked() {
-                    self.playing = !self.playing;
+                    self.transport_toggle();
+                }
+                if ui.button("Stop").clicked() {
+                    self.transport_stop();
+                }
+                if ui.checkbox(&mut self.loop_on, "Loop").changed() {
+                    self.apply_loop();
+                }
+                if let Some((a, b)) = self.loop_region {
+                    ui.monospace(format!("{:.2}\u{2013}{:.2}s", a, b));
+                    if ui.small_button("x").clicked() {
+                        self.loop_region = None;
+                        self.loop_drag = None;
+                        self.apply_loop();
+                    }
+                } else {
+                    ui.small("loop: shift+drag ruler");
                 }
                 ui.label(format_time(self.playhead));
                 ui.separator();
@@ -1470,6 +1667,14 @@ impl OpenTrackApp {
                 ui.separator();
                 let mut master = self.session.project.master.gain_db;
                 let mr = ui.add_sized([80.0, 16.0], egui::Slider::new(&mut master, -60.0..=12.0));
+                if mr.changed() {
+                    // Live (lock-free) while dragging.
+                    self.audio.set_master(
+                        master,
+                        self.session.project.master.pan,
+                        self.session.project.master.mute,
+                    );
+                }
                 if mr.drag_stopped() {
                     let old = self.session.project.master.clone();
                     let mut new = old.clone();
@@ -1477,6 +1682,12 @@ impl OpenTrackApp {
                     self.exec(ctx, EditOp::SetMaster { old, new });
                 }
                 ui.label("master");
+                meter_bar(
+                    ui,
+                    egui::vec2(90.0, 12.0),
+                    self.master_meter.0,
+                    Some(self.master_meter.1),
+                );
                 ui.separator();
                 ui.add(
                     egui::Slider::new(&mut self.zoom, 10.0..=400.0)
@@ -1489,7 +1700,28 @@ impl OpenTrackApp {
                     {
                         ui.small(msg.clone());
                     }
-                    ui.colored_label(egui::Color32::from_rgb(150, 200, 150), "M1");
+                    if self.audio.available() {
+                        let underruns = self.audio.underruns();
+                        let issues = self.audio.decode_issues();
+                        if underruns > 0 || issues > 0 {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 150, 90),
+                                format!("underruns {underruns} · decode issues {issues}"),
+                            );
+                        }
+                        ui.small(format!(
+                            "M2 · {:.0} ms latency",
+                            self.audio.latency_secs() * 1000.0
+                        ));
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 170, 90),
+                            self.audio
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "audio unavailable".into()),
+                        );
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -1510,6 +1742,7 @@ impl OpenTrackApp {
                         ui.label("A clean-room, GPL-3.0 NLE inspired by the Vegas workflow,");
                         ui.label("rebuilt from scratch in pure Rust.");
                         ui.label("M1: interactive timeline editing + pure-Rust video preview.");
+                        ui.label("M2: realtime audio playback, peak meters, loop transport.");
                         ui.add_space(4.0);
                         ui.small("OpenTrack is not affiliated with, endorsed by, or derived from");
                         ui.small("Sony Creative Software or MAGIX Software GmbH. \"Vegas\" is a");
@@ -1553,6 +1786,8 @@ impl OpenTrackApp {
                             self.selected = None;
                             self.preview = None;
                             self.playhead = 0.0;
+                            self.transport_stop();
+                            self.audio.set_project(&self.session.project);
                             self.toast(ctx, format!("loaded {path}"));
                         }
                         Err(e) => self.toast(ctx, format!("load failed: {e}")),
@@ -1611,4 +1846,80 @@ fn format_time(secs: f64) -> String {
     let m = (secs / 60.0).floor();
     let s = secs - m * 60.0;
     format!("{:02}:{:05.2}", m, s)
+}
+
+/// Peak meter bar: dB-mapped linear scale over [-60 dB, 0 dB] with the
+/// classic green/yellow/red zones. `right` renders a second (lower) bar.
+fn meter_bar(ui: &mut egui::Ui, size: egui::Vec2, left: f32, right: Option<f32>) {
+    let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(18, 20, 24));
+    let rows: Vec<(egui::Rect, f32)> = match right {
+        Some(r) => {
+            let h = rect.height() / 2.0 - 1.0;
+            vec![
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
+                        egui::vec2(rect.width() - 2.0, h),
+                    ),
+                    left,
+                ),
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + 1.0, rect.top() + rect.height() / 2.0),
+                        egui::vec2(rect.width() - 2.0, h),
+                    ),
+                    r,
+                ),
+            ]
+        }
+        None => vec![(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
+                egui::vec2(rect.width() - 2.0, rect.height() - 2.0),
+            ),
+            left,
+        )],
+    };
+    for (row, v) in rows {
+        let db = if v > 0.0 { 20.0 * v.log10() } else { -96.0 };
+        let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+        let w = row.width() * frac;
+        if w < 0.5 {
+            continue;
+        }
+        // Zones: green to -12 dB, yellow to -3 dB, red above.
+        let green_end = row.width() * 0.8;
+        let yellow_end = row.width() * 0.95;
+        let green_w = w.min(green_end);
+        if green_w > 0.0 {
+            painter.rect_filled(
+                egui::Rect::from_min_size(row.min, egui::vec2(green_w, row.height())),
+                1.0,
+                egui::Color32::from_rgb(70, 190, 110),
+            );
+        }
+        if w > green_end {
+            let yw = (w - green_end).min(yellow_end - green_end);
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(row.left() + green_end, row.top()),
+                    egui::vec2(yw, row.height()),
+                ),
+                1.0,
+                egui::Color32::from_rgb(220, 190, 70),
+            );
+        }
+        if w > yellow_end {
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(row.left() + yellow_end, row.top()),
+                    egui::vec2(w - yellow_end, row.height()),
+                ),
+                1.0,
+                egui::Color32::from_rgb(220, 90, 80),
+            );
+        }
+    }
 }

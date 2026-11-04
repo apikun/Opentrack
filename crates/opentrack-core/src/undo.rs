@@ -360,11 +360,17 @@ impl EditOp {
 }
 
 /// Undo/redo stacks with a bounded history.
+///
+/// Besides the stacks, [`History`] carries a monotonically increasing
+/// `revision`: every applied/undone/redone op bumps it. Consumers that watch
+/// the project (the realtime engine's mix graph, autosave, ...) diff this
+/// cheap integer instead of polling the whole document.
 #[derive(Debug, Default)]
 pub struct History {
     undo_stack: Vec<EditOp>,
     redo_stack: Vec<EditOp>,
     limit: usize,
+    revision: u64,
 }
 
 impl History {
@@ -374,7 +380,13 @@ impl History {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             limit: limit.max(1),
+            revision: 0,
         }
+    }
+
+    /// Monotonic change counter: bumped by every `push`/`undo`/`redo`.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Applies `op` and records it, clearing the redo branch.
@@ -385,6 +397,7 @@ impl History {
         if self.undo_stack.len() > self.limit {
             self.undo_stack.remove(0);
         }
+        self.revision += 1;
         Ok(())
     }
 
@@ -396,6 +409,7 @@ impl History {
         let label = op.label();
         op.revert(p)?;
         self.redo_stack.push(op);
+        self.revision += 1;
         Ok(Some(label))
     }
 
@@ -407,6 +421,7 @@ impl History {
         let label = op.label();
         op.apply(p)?;
         self.undo_stack.push(op);
+        self.revision += 1;
         Ok(Some(label))
     }
 
@@ -428,5 +443,54 @@ impl History {
     /// Whether nothing has been recorded.
     pub fn is_empty(&self) -> bool {
         self.undo_stack.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::Project;
+    use crate::timeline::TrackKind;
+
+    fn add_track_op(p: &mut Project) -> EditOp {
+        let id = p.alloc_id();
+        EditOp::AddTrack {
+            index: p.tracks.len(),
+            track: Track {
+                id: crate::TrackId::from_raw(id),
+                name: "T".into(),
+                kind: TrackKind::Audio(Default::default()),
+                events: vec![],
+                locked: false,
+            },
+        }
+    }
+
+    #[test]
+    fn revision_bumps_on_push_undo_redo() {
+        let mut p = Project::new("r");
+        let mut h = History::new(16);
+        assert_eq!(h.revision(), 0);
+        h.push(add_track_op(&mut p), &mut p).unwrap();
+        let r1 = h.revision();
+        assert_eq!(r1, 1);
+        h.undo(&mut p).unwrap();
+        let r2 = h.revision();
+        assert_eq!(r2, 2);
+        h.redo(&mut p).unwrap();
+        assert_eq!(h.revision(), 3);
+        // failed ops must not bump
+        let stale = EditOp::SetMaster {
+            old: p.master.clone(),
+            new: p.master.clone(),
+        };
+        // SetMaster always applies; use a stale track op instead
+        let bad = EditOp::RemoveTrack {
+            index: 999,
+            track: p.tracks[0].clone(),
+        };
+        assert!(h.push(bad, &mut p).is_err());
+        assert!(h.push(stale, &mut p).is_ok());
+        assert_eq!(h.revision(), 4);
     }
 }

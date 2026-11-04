@@ -88,8 +88,9 @@ fn read_all(src: &mut dyn AudioSource) -> Result<Vec<f32>, CodecError> {
     Ok(out)
 }
 
-/// Linear fade gain at sample `i` of a `len`-sample event.
-fn fade_gain(i: usize, len: usize, fade_in: usize, fade_out: usize) -> f32 {
+/// Linear fade gain at sample `i` of a `len`-sample event. Shared with the
+/// realtime engine so fades are bit-identical online and offline.
+pub(crate) fn fade_gain(i: usize, len: usize, fade_in: usize, fade_out: usize) -> f32 {
     let mut g = 1.0f32;
     if fade_in > 0 && i < fade_in {
         g *= i as f32 / fade_in as f32;
