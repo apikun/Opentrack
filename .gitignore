@@ -1,0 +1,19 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local demo render outputs
+/demo_out/
+*.wav
+*.otp.lock
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.idea/
+.vscode/
+*.swp
