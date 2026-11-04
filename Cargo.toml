@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/opentrack-core",
+    "crates/opentrack-engine",
+    "crates/opentrack-cli",
+    "crates/opentrack-app",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+authors = ["OpenTrack contributors"]
+repository = "https://github.com/apikun/Opentrack"
+homepage = "https://github.com/apikun/Opentrack"
+
+[workspace.dependencies]
+opentrack-core = { path = "crates/opentrack-core" }
+opentrack-engine = { path = "crates/opentrack-engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

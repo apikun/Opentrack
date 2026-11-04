@@ -1,0 +1,14 @@
+[package]
+name = "opentrack-app"
+description = "OpenTrack GUI shell (egui): timeline visualization, project open/save"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+opentrack-core = { workspace = true }
+opentrack-engine = { workspace = true }
+eframe = { workspace = true }

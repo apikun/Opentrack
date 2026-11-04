@@ -1,0 +1,74 @@
+# OpenTrack CI — Windows is the primary target (Vegas-class NLEs live on Windows),
+# so it is first in the matrix and runs the full test suite. Linux/macOS follow.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest # PRIMARY — keep first
+          - os: ubuntu-latest
+          - os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build
+        uses: swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build (debug)
+        run: cargo build --workspace
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: CLI smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo run -p opentrack-cli -- demo "$env:TEMP\opentrack-demo"
+
+      - name: CLI smoke test (Unix)
+        if: runner.os != 'Windows'
+        run: cargo run -p opentrack-cli -- demo /tmp/opentrack-demo
+
+  headless-app-check:
+    # The egui shell must at least compile on every platform. We do not open a
+    # window in CI (no display); a plain `cargo build` proves linkage.
+    name: gui-compile / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest # PRIMARY
+          - os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - name: Build GUI shell
+        run: cargo build -p opentrack-app
